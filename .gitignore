@@ -1,0 +1,42 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Large datasets & competition raw files
+data/train/*.tsv
+data/test/*.tsv
+data/**/*.tsv
+data/**/*.csv
+data/**/*.parquet
+
+# Model artifacts & checkpoints
+models/*.bin
+models/*.pt
+models/*.pth
+models/*.pkl
+models/*.joblib
+models/*.txt
+
+# Heavy output files & submissions
+output/*.tsv
+output/*.csv
+output/*.parquet
+output/smoke_*.tsv
+
+# IDE, OS, & scratch files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+scratch/
+.pytest_cache/
+.ipynb_checkpoints/
