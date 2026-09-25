@@ -40,9 +40,11 @@ amazon-entity-resolution/
 ├── tests/
 │   ├── test_foundation.py     # Synthetic contract tests (schemas, I/O, splits, F0.5 metric)
 │   ├── test_normalize.py      # Unicode normalization tests (Indic scripts, French accents)
-│   └── test_blocking.py       # Blocking tests (unseen countries, candidate containment)
+│   ├── test_blocking.py       # Blocking tests (unseen countries, candidate containment)
+│   ├── test_phase1.py         # Phase 1 MinHash LSH, inverted index, & validation recall tests
+│   └── test_pilot.py          # Bounded pilot mode & deterministic sampling tests
 │
-├── kaggle_phase3.py           # Kaggle entry point for candidate blocking
+├── kaggle_phase1.py           # Phase 1 candidate generation, bounded pilot & validation CLI
 ├── requirements.txt           # Pinned/bounded dependencies
 └── README.md
 ```
@@ -81,7 +83,7 @@ To ensure unbiased evaluation and prevent data leakage:
 # Install bounded dependencies
 pip install -r requirements.txt
 
-# Run all unit tests with synthetic data (< 0.2s runtime)
+# Run all unit tests with synthetic data (< 0.5s runtime)
 python -m unittest discover -s tests
 ```
 
@@ -89,11 +91,51 @@ python -m unittest discover -s tests
 
 ## Kaggle Execution
 
-In a Kaggle Notebook:
-```bash
-# Run fast smoke test on 5,000 samples
-!python kaggle_phase3.py --mode smoke --sample-s1 5000
+### 1. Bounded Phase 1 Pilot (`--mode pilot` - Recommended First Run)
 
-# Full train evaluation or test candidate generation
-!python kaggle_phase3.py --mode test
+To safely benchmark throughput, process memory, and plumbing without running out of RAM, use the streaming bounded pilot. It reads source TSVs in bounded chunks (`chunksize=50,000`), scans up to a configurable row window (`scan_rows=250,000`), and selects deterministic ID-hash samples (1,000 validation S1 queries, 5,000 S2 targets, 5,000 S3 targets).
+
+```bash
+python kaggle_phase1.py \
+  --mode pilot \
+  --data-dir /kaggle/input/datasets/manoharjha17/amazon/student_resource/dataset \
+  --pilot-scan-rows 250000 \
+  --pilot-chunksize 50000 \
+  --pilot-seed 42 \
+  --sample-s1 1000 \
+  --sample-target 5000 \
+  --track-memory
 ```
+
+> [!NOTE]
+> **Pilot Disclaimer**: Pilot mode is strictly for resource, memory, and plumbing validation. Candidate recall is **not** computed because prefix-window target sampling is not representative of full-corpus recall. Results and metrics are written to `output/pilot_summary.json`.
+
+---
+
+### 2. Full Validation Recall Evaluation (`--mode eval_val`)
+
+Measures true candidate recall on the saved validation split against `train_ground_truth.tsv`.
+
+```bash
+python kaggle_phase1.py \
+  --mode eval_val \
+  --data-dir /kaggle/input/datasets/manoharjha17/amazon/student_resource/dataset \
+  --track-memory
+```
+
+> [!WARNING]
+> **Memory Warning**: Full validation loads complete Source 1 (~2.2M rows), Source 2 (~5.0M rows), Source 3 (~5.3M rows), and ground truth into memory to build full indexes. This requires high RAM (16GB+). For quick resource and plumbing checks, always use `--mode pilot` first.
+
+---
+
+### 3. Full Test Candidate Generation (`--mode test`)
+
+Generates `output/candidate_pairs.tsv` and pair-level `output/candidate_provenance.tsv` for all test Source 1 entities:
+
+```bash
+python kaggle_phase1.py \
+  --mode test \
+  --data-dir /kaggle/input/datasets/manoharjha17/amazon/student_resource/dataset \
+  --track-memory
+```
+

@@ -93,3 +93,14 @@ COMMON_LEGAL_TERMS: set[str] = {
     "technologies", "technology", "international", "associates", "solutions",
     "industries", "ventures", "management", "development", "trading",
 }
+
+# ==============================================================================
+# Phase 1: Bounded Pilot Configuration Defaults
+# ==============================================================================
+PILOT_SCAN_ROWS: int = int(os.environ.get("PILOT_SCAN_ROWS", "250000"))
+PILOT_CHUNKSIZE: int = int(os.environ.get("PILOT_CHUNKSIZE", "50000"))
+PILOT_SEED: int = int(os.environ.get("PILOT_SEED", "42"))
+PILOT_SAMPLE_S1: int = int(os.environ.get("PILOT_SAMPLE_S1", "1000"))
+PILOT_SAMPLE_TARGET: int = int(os.environ.get("PILOT_SAMPLE_TARGET", "5000"))
+PILOT_SUMMARY_PATH: Path = OUTPUT_DIR / "pilot_summary.json"
+

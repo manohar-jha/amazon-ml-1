@@ -4,8 +4,9 @@ This module provides reusable functions to load and validate TSV source files
 and ground truth annotations without altering the original raw data.
 """
 
+import hashlib
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional, Set, Tuple, Union
 import pandas as pd
 
 from src.config import (
@@ -100,6 +101,146 @@ def load_ground_truth(
         )
 
     return df
+
+
+def deterministic_id_hash(entity_id: str, seed: int = 42) -> str:
+    """Generate deterministic SHA-256 hash string for an entity ID given a seed."""
+    return hashlib.sha256(f"{seed}_{entity_id}".encode("utf-8")).hexdigest()
+
+
+def scan_and_sample_source_file(
+    path: Union[Path, str],
+    scan_rows: int = 250000,
+    sample_size: int = 5000,
+    chunksize: int = 50000,
+    seed: int = 42,
+    filter_ids: Optional[Set[str]] = None,
+    expected_columns: Optional[list[str]] = None,
+) -> Tuple[pd.DataFrame, int]:
+    """Stream-scan a source TSV up to scan_rows and deterministically sample rows.
+
+    Memory bounded: Processed in chunks of chunksize without loading the full file.
+    Deterministic: Selected rows are chosen by sorting IDs on deterministic hash.
+
+    Args:
+        path: Path to the TSV file.
+        scan_rows: Maximum rows to inspect from the start of the file.
+        sample_size: Target number of sampled rows to return.
+        chunksize: Number of rows per streaming pandas chunk.
+        seed: Random seed for deterministic hash computation.
+        filter_ids: Optional set of entity IDs to restrict selection to (e.g. validation split).
+        expected_columns: Expected columns in the TSV.
+
+    Returns:
+        Tuple[pd.DataFrame, int]: Sampled DataFrame and total number of rows scanned.
+
+    Raises:
+        FileNotFoundError: If the source TSV does not exist.
+        ValueError: If filter_ids is provided and no matching entities were found within scan_rows.
+    """
+    file_path = Path(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"Source file not found at: {file_path.resolve()}")
+
+    if expected_columns is None:
+        expected_columns = SOURCE_EXPECTED_COLUMNS
+
+    total_scanned = 0
+    candidate_chunks: list[pd.DataFrame] = []
+
+    # Read in bounded chunks with explicit tab separator and string dtype
+    reader = pd.read_csv(
+        file_path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+        chunksize=chunksize,
+    )
+
+    try:
+        for chunk in reader:
+            # Validate columns on first chunk
+            if total_scanned == 0:
+                missing_cols = [col for col in expected_columns if col not in chunk.columns]
+                if missing_cols:
+                    raise ValueError(
+                        f"File '{file_path.name}' is missing expected columns: {missing_cols}. "
+                        f"Found columns: {list(chunk.columns)}"
+                    )
+
+            remaining_to_scan = scan_rows - total_scanned
+            if remaining_to_scan <= 0:
+                break
+
+            if len(chunk) > remaining_to_scan:
+                chunk = chunk.iloc[:remaining_to_scan]
+
+            total_scanned += len(chunk)
+
+            # Apply ID filter if specified (e.g. validation split S1 IDs)
+            if filter_ids is not None:
+                filtered_chunk = chunk[chunk["entity_id"].isin(filter_ids)]
+            else:
+                filtered_chunk = chunk
+
+            if not filtered_chunk.empty:
+                # Keep memory bounded: prune chunk to top sample_size by deterministic hash
+                if len(filtered_chunk) > sample_size:
+                    filtered_chunk = filtered_chunk.copy()
+                    filtered_chunk["_hash"] = filtered_chunk["entity_id"].apply(
+                        lambda eid: hashlib.sha256(f"{seed}_{eid}".encode("utf-8")).hexdigest()
+                    )
+                    filtered_chunk = (
+                        filtered_chunk.sort_values("_hash")
+                        .head(sample_size)
+                        .drop(columns=["_hash"])
+                    )
+
+                candidate_chunks.append(filtered_chunk)
+
+                # Periodically consolidate candidate chunks to keep memory footprint minimal
+                if len(candidate_chunks) > 5:
+                    merged = pd.concat(candidate_chunks, ignore_index=True)
+                    if len(merged) > sample_size:
+                        merged["_hash"] = merged["entity_id"].apply(
+                            lambda eid: hashlib.sha256(f"{seed}_{eid}".encode("utf-8")).hexdigest()
+                        )
+                        merged = (
+                            merged.sort_values("_hash")
+                            .head(sample_size)
+                            .drop(columns=["_hash"])
+                        )
+                    candidate_chunks = [merged]
+
+            if total_scanned >= scan_rows:
+                break
+    finally:
+        reader.close()
+
+    if not candidate_chunks:
+        if filter_ids is not None:
+            raise ValueError(
+                f"No validation S1 IDs were found in the initial {total_scanned:,} scanned rows of '{file_path.name}'. "
+                f"Try increasing --pilot-scan-rows (e.g. --pilot-scan-rows {max(scan_rows * 2, 500000)}) or adjusting --pilot-chunksize."
+            )
+        return pd.DataFrame(columns=expected_columns), total_scanned
+
+    final_df = pd.concat(candidate_chunks, ignore_index=True)
+    if len(final_df) > sample_size:
+        final_df["_hash"] = final_df["entity_id"].apply(
+            lambda eid: hashlib.sha256(f"{seed}_{eid}".encode("utf-8")).hexdigest()
+        )
+        final_df = (
+            final_df.sort_values("_hash")
+            .head(sample_size)
+            .drop(columns=["_hash"])
+            .reset_index(drop=True)
+        )
+    else:
+        final_df = final_df.reset_index(drop=True)
+
+    return final_df, total_scanned
+
 
 
 def load_training_data(

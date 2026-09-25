@@ -23,12 +23,13 @@ Usage:
 
 import argparse
 import gc
+import json
 import os
 import sys
 import time
 import tracemalloc
 from pathlib import Path
-from typing import Optional, Set
+from typing import Any, Dict, Optional, Set
 
 # Ensure project root in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -51,6 +52,12 @@ from src.config import (
     BLOCKING_MAX_CANDIDATES_PER_S1,
     DATA_DIR,
     OUTPUT_DIR,
+    PILOT_CHUNKSIZE,
+    PILOT_SCAN_ROWS,
+    PILOT_SAMPLE_S1,
+    PILOT_SAMPLE_TARGET,
+    PILOT_SEED,
+    PILOT_SUMMARY_PATH,
     SPLITS_DIR,
 )
 from src.data_loader import (
@@ -58,11 +65,47 @@ from src.data_loader import (
     load_source_file,
     load_test_data,
     load_training_data,
+    scan_and_sample_source_file,
 )
 from src.io_utils import read_tsv
 from src.normalize import normalize_dataframe
 from src.split_utils import load_split_ids
 from utils.validate_submission import validate_submission_file
+
+
+def get_process_memory_mb() -> Dict[str, float]:
+    """Get current and peak process memory usage in megabytes (MB)."""
+    mem_info: Dict[str, float] = {}
+
+    # 1. OS-level process memory via psutil
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        mem_info["rss_mb"] = proc.memory_info().rss / (1024 * 1024)
+        if hasattr(proc.memory_info(), "peak_wset"):
+            mem_info["peak_rss_mb"] = proc.memory_info().peak_wset / (1024 * 1024)
+    except Exception:
+        pass
+
+    # 2. OS-level process memory via resource (standard on Linux / Kaggle)
+    try:
+        import resource
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        # On Linux ru_maxrss is in KB; on macOS in bytes
+        if sys.platform == "darwin":
+            mem_info["peak_rss_mb"] = ru.ru_maxrss / (1024 * 1024)
+        else:
+            mem_info["peak_rss_mb"] = ru.ru_maxrss / 1024.0
+    except Exception:
+        pass
+
+    # 3. Tracemalloc Python heap tracker
+    if tracemalloc.is_tracing():
+        cur, peak = tracemalloc.get_traced_memory()
+        mem_info["tracemalloc_cur_mb"] = cur / (1024 * 1024)
+        mem_info["tracemalloc_peak_mb"] = peak / (1024 * 1024)
+
+    return mem_info
 
 
 def resolve_paths(
@@ -345,20 +388,231 @@ def run_test_generation(
     print(f"Test candidate generation completed in {time.time() - t_start:.2f}s.\n", flush=True)
 
 
+def run_pilot(
+    train_dir: Path,
+    splits_dir: Path,
+    out_dir: Path,
+    scan_rows: int = PILOT_SCAN_ROWS,
+    chunksize: int = PILOT_CHUNKSIZE,
+    seed: int = PILOT_SEED,
+    sample_s1: int = PILOT_SAMPLE_S1,
+    sample_target: int = PILOT_SAMPLE_TARGET,
+    max_candidates: int = BLOCKING_MAX_CANDIDATES_PER_S1,
+) -> None:
+    """Execute bounded pilot run for plumbing, resource, and candidate pipeline verification."""
+    print("\n" + "=" * 75, flush=True)
+    print("PHASE 1 BOUNDED PILOT EXECUTION", flush=True)
+    print("=" * 75, flush=True)
+    print("NOTICE: Pilot mode runs bounded sampling for resource and plumbing verification.", flush=True)
+    print("Candidate recall is NOT calculated in pilot mode (target-sampling is non-representative).", flush=True)
+    print(f"Scan Window     : First {scan_rows:,} rows per source file", flush=True)
+    print(f"Chunk Size      : {chunksize:,} rows", flush=True)
+    print(f"Random Seed     : {seed}", flush=True)
+    print(f"Target Samples  : S1 Queries = {sample_s1:,}, S2 Targets = {sample_target:,}, S3 Targets = {sample_target:,}", flush=True)
+    print("=" * 75, flush=True)
+
+    t_start = time.time()
+
+    # 1. Load saved validation split IDs (read-only)
+    val_txt = splits_dir / "validation_s1_ids.txt"
+    if not val_txt.exists():
+        raise FileNotFoundError(
+            f"Validation split file not found at '{val_txt.resolve()}'. "
+            "Please ensure output/splits/validation_s1_ids.txt exists."
+        )
+
+    with open(val_txt, "r", encoding="utf-8") as f:
+        val_s1_ids = {line.strip() for line in f if line.strip()}
+    print(f"Loaded {len(val_s1_ids):,} saved validation S1 IDs from '{val_txt.name}'.", flush=True)
+
+    # 2. Stream-scan and sample Source 1 restricted to validation split IDs
+    print(f"\n1. Scanning 'train_source1.tsv' (up to {scan_rows:,} rows, filtered on validation IDs)...", flush=True)
+    t_s1 = time.time()
+    s1_raw, s1_scanned = scan_and_sample_source_file(
+        path=train_dir / "train_source1.tsv",
+        scan_rows=scan_rows,
+        sample_size=sample_s1,
+        chunksize=chunksize,
+        seed=seed,
+        filter_ids=val_s1_ids,
+    )
+    s1_load_time = time.time() - t_s1
+    print(f"   -> Selected {len(s1_raw):,} validation S1 queries (scanned {s1_scanned:,} rows in {s1_load_time:.2f}s).", flush=True)
+
+    # 3. Stream-scan and sample Source 2
+    print(f"\n2. Scanning 'train_source2.tsv' (up to {scan_rows:,} rows, deterministic hash sample)...", flush=True)
+    t_s2 = time.time()
+    s2_raw, s2_scanned = scan_and_sample_source_file(
+        path=train_dir / "train_source2.tsv",
+        scan_rows=scan_rows,
+        sample_size=sample_target,
+        chunksize=chunksize,
+        seed=seed,
+    )
+    s2_load_time = time.time() - t_s2
+    print(f"   -> Selected {len(s2_raw):,} S2 target entities (scanned {s2_scanned:,} rows in {s2_load_time:.2f}s).", flush=True)
+
+    # 4. Stream-scan and sample Source 3
+    print(f"\n3. Scanning 'train_source3.tsv' (up to {scan_rows:,} rows, deterministic hash sample)...", flush=True)
+    t_s3 = time.time()
+    s3_raw, s3_scanned = scan_and_sample_source_file(
+        path=train_dir / "train_source3.tsv",
+        scan_rows=scan_rows,
+        sample_size=sample_target,
+        chunksize=chunksize,
+        seed=seed,
+    )
+    s3_load_time = time.time() - t_s3
+    print(f"   -> Selected {len(s3_raw):,} S3 target entities (scanned {s3_scanned:,} rows in {s3_load_time:.2f}s).", flush=True)
+
+    data_scan_time = time.time() - t_start
+
+    # 5. Normalization
+    print("\n4. Normalizing bounded DataFrames...", flush=True)
+    t_norm = time.time()
+    s1 = normalize_dataframe(s1_raw, inplace=True)
+    s2 = normalize_dataframe(s2_raw, inplace=True)
+    s3 = normalize_dataframe(s3_raw, inplace=True)
+    norm_time = time.time() - t_norm
+    print(f"   -> Normalization completed in {norm_time:.2f}s.", flush=True)
+
+    # 6. Candidate Generation
+    total_targets = len(s2) + len(s3)
+    print(f"\n5. Generating candidate union for {len(s1):,} S1 queries against {total_targets:,} targets...", flush=True)
+    t_gen = time.time()
+    cands_map, prov_records, stats = generate_candidate_union(
+        s1_df=s1,
+        s2_df=s2,
+        s3_df=s3,
+        max_candidates=max_candidates,
+    )
+    gen_time = time.time() - t_gen
+    throughput = len(s1) / gen_time if gen_time > 0 else 0.0
+    print(f"   -> Candidate generation completed in {gen_time:.2f}s ({throughput:.1f} queries/s).", flush=True)
+
+    # 7. Serialize pilot outputs
+    pilot_pairs_path = out_dir / "pilot_candidate_pairs.tsv"
+    pilot_prov_path = out_dir / "pilot_candidate_provenance.tsv"
+    print(f"\n6. Writing pilot candidate files...", flush=True)
+    write_candidate_outputs(
+        candidates_map=cands_map,
+        provenance_records=prov_records,
+        ordered_s1_ids=s1["entity_id"].tolist(),
+        candidate_pairs_path=pilot_pairs_path,
+        provenance_path=pilot_prov_path,
+    )
+
+    # 8. Validate output TSV schema
+    target_ids = set(s2["entity_id"]).union(set(s3["entity_id"]))
+    is_valid, errors = validate_submission_file(
+        submission_path=pilot_pairs_path,
+        expected_s1_ids=set(s1["entity_id"]),
+        valid_target_ids=target_ids,
+        is_candidate_file=True,
+    )
+
+    total_elapsed = time.time() - t_start
+    mem_info = get_process_memory_mb()
+
+    # 9. Build summary metrics
+    summary = {
+        "mode": "pilot",
+        "notice": (
+            "Pilot mode uses prefix-window and sampled targets. Candidate recall is NOT "
+            "computed because target sampling is not representative of full-corpus recall."
+        ),
+        "configuration": {
+            "scan_rows": scan_rows,
+            "chunksize": chunksize,
+            "seed": seed,
+            "sample_s1_requested": sample_s1,
+            "sample_target_requested": sample_target,
+            "max_candidates": max_candidates,
+        },
+        "sampled_counts": {
+            "source1_validation_queries": len(s1),
+            "source1_scanned_rows": s1_scanned,
+            "source2_targets": len(s2),
+            "source2_scanned_rows": s2_scanned,
+            "source3_targets": len(s3),
+            "source3_scanned_rows": s3_scanned,
+            "total_targets": total_targets,
+            "total_candidate_pairs": len(prov_records),
+        },
+        "candidate_distribution": {
+            "mean": stats["mean_candidates"],
+            "median": stats["median_candidates"],
+            "p90": stats["p90_candidates"],
+            "p95": stats["p95_candidates"],
+            "p99": stats["p99_candidates"],
+            "max": stats["max_candidates"],
+            "empty_candidate_count": stats["empty_candidate_count"],
+            "empty_candidate_rate": stats["empty_candidate_rate"],
+            "truncation_count": stats["truncation_count"],
+            "truncation_rate": stats["truncation_rate"],
+        },
+        "timing_seconds": {
+            "data_scan_and_load": round(data_scan_time, 3),
+            "normalization": round(norm_time, 3),
+            "candidate_generation": round(gen_time, 3),
+            "total_elapsed": round(total_elapsed, 3),
+            "query_throughput_qps": round(throughput, 1),
+        },
+        "memory_mb": {
+            "current_rss_mb": round(mem_info.get("rss_mb", 0.0), 2),
+            "peak_rss_mb": round(mem_info.get("peak_rss_mb", 0.0), 2),
+            "tracemalloc_peak_mb": round(mem_info.get("tracemalloc_peak_mb", 0.0), 2),
+        },
+        "validation_schema_valid": is_valid,
+        "validation_schema_errors": errors,
+    }
+
+    # 10. Write summary JSON
+    summary_path = out_dir / "pilot_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    # 11. Print formatted console report
+    print("\n" + "#" * 75, flush=True)
+    print("# PILOT EXECUTION SUMMARY", flush=True)
+    print("#" * 75, flush=True)
+    print(f"Summary JSON Written        : {summary_path.resolve()}", flush=True)
+    print(f"Validation S1 Queries       : {len(s1):,} (scanned {s1_scanned:,} rows)", flush=True)
+    print(f"Target Entities (S2 + S3)   : {total_targets:,} ({len(s2):,} S2 + {len(s3):,} S3)", flush=True)
+    print(f"Candidate Pairs Generated   : {len(prov_records):,}", flush=True)
+    print(f"Query Throughput            : {throughput:.1f} queries/second", flush=True)
+    print(f"Candidate Count / Query     : Mean={stats['mean_candidates']:.1f}, Median={stats['median_candidates']:.0f}, P95={stats['p95_candidates']:.0f}, Max={stats['max_candidates']}", flush=True)
+    print(f"Empty Candidate Rate        : {stats['empty_candidate_rate'] * 100:.2f}% ({stats['empty_candidate_count']:,} queries)", flush=True)
+    print(f"Candidate Truncation Rate   : {stats['truncation_rate'] * 100:.2f}% ({stats['truncation_count']:,} queries hit limit)", flush=True)
+    print(f"Elapsed Time                : Total {total_elapsed:.2f}s (Load: {data_scan_time:.2f}s, Norm: {norm_time:.2f}s, Gen: {gen_time:.2f}s)", flush=True)
+    if mem_info.get("peak_rss_mb"):
+        print(f"Peak Process Memory (RSS)   : {mem_info['peak_rss_mb']:.1f} MB", flush=True)
+    elif mem_info.get("rss_mb"):
+        print(f"Current Process Memory (RSS): {mem_info['rss_mb']:.1f} MB", flush=True)
+    if mem_info.get("tracemalloc_peak_mb"):
+        print(f"Tracemalloc Peak Heap       : {mem_info['tracemalloc_peak_mb']:.1f} MB", flush=True)
+    print(f"TSV Schema Validation       : {'100% VALID' if is_valid else 'ERRORS: ' + str(errors)}", flush=True)
+    print("=" * 75, flush=True)
+    print("[SUCCESS] Bounded pilot completed successfully.\n", flush=True)
+
+
 def main() -> None:
     """Main CLI entry point for Phase 1 candidate generation on Kaggle."""
     parser = argparse.ArgumentParser(description="Kaggle Phase 1 Candidate Generation & Validation Evaluation")
     parser.add_argument(
         "--mode",
-        choices=["smoke", "eval_val", "test", "all"],
-        default="smoke",
-        help="Mode: smoke (fast verification), eval_val (validation recall), test (test candidate files), all (both)",
+        choices=["pilot", "smoke", "eval_val", "test", "all"],
+        default="pilot",
+        help="Mode: pilot (bounded plumbing/resource verification), smoke (fast check), eval_val (validation recall), test (test candidate files), all (both)",
     )
     parser.add_argument("--data-dir", type=str, default=None, help="Path to data directory")
     parser.add_argument("--splits-dir", type=str, default=None, help="Path to splits directory (output/splits)")
     parser.add_argument("--output-dir", type=str, default=None, help="Path to output directory")
-    parser.add_argument("--sample-s1", type=int, default=None, help="Optional sample limit for S1 entities")
-    parser.add_argument("--sample-target", type=int, default=5000, help="Optional sample limit for S2/S3 entities in smoke mode")
+    parser.add_argument("--pilot-scan-rows", type=int, default=PILOT_SCAN_ROWS, help="Initial rows to scan per source TSV in pilot mode")
+    parser.add_argument("--pilot-chunksize", type=int, default=PILOT_CHUNKSIZE, help="Chunk size for streaming TSV reads in pilot mode")
+    parser.add_argument("--pilot-seed", type=int, default=PILOT_SEED, help="Seed for deterministic ID-hash sampling in pilot mode")
+    parser.add_argument("--sample-s1", type=int, default=None, help="Sample limit for S1 queries (default: 1000 in pilot mode)")
+    parser.add_argument("--sample-target", type=int, default=None, help="Sample limit for S2/S3 targets (default: 5000 in pilot mode)")
     parser.add_argument("--max-candidates", type=int, default=BLOCKING_MAX_CANDIDATES_PER_S1, help="Max candidates per S1")
     parser.add_argument("--track-memory", action="store_true", help="Enable memory tracking")
 
@@ -384,13 +638,29 @@ def main() -> None:
     print(f"Max Candidates   : {args.max_candidates}", flush=True)
     print("#" * 75 + "\n", flush=True)
 
-    if args.mode == "smoke":
-        sample_size = args.sample_s1 if args.sample_s1 else 1000
+    if args.mode == "pilot":
+        sample_s1 = args.sample_s1 if args.sample_s1 is not None else PILOT_SAMPLE_S1
+        sample_target = args.sample_target if args.sample_target is not None else PILOT_SAMPLE_TARGET
+        run_pilot(
+            train_dir=train_dir,
+            splits_dir=splits_dir,
+            out_dir=out_dir,
+            scan_rows=args.pilot_scan_rows,
+            chunksize=args.pilot_chunksize,
+            seed=args.pilot_seed,
+            sample_s1=sample_s1,
+            sample_target=sample_target,
+            max_candidates=args.max_candidates,
+        )
+
+    elif args.mode == "smoke":
+        sample_size = args.sample_s1 if args.sample_s1 is not None else 1000
+        sample_target = args.sample_target if args.sample_target is not None else 5000
         run_smoke_test(
             train_dir=train_dir,
             out_dir=out_dir,
             sample_size=sample_size,
-            sample_target=args.sample_target,
+            sample_target=sample_target,
             max_candidates=args.max_candidates,
         )
 
@@ -428,3 +698,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
