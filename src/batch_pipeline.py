@@ -116,10 +116,76 @@ def get_available_ram_gb() -> Optional[float]:
     return round(b / (1024 ** 3), 2) if b is not None else None
 
 
+def measure_serialized_row_sizes(
+    sample_targets_df: Optional[pd.DataFrame] = None,
+    sample_s1_df: Optional[pd.DataFrame] = None,
+    safety_margin: float = 1.25,
+) -> Dict[str, float]:
+    """Measure conservative serialized row sizes in bytes from actual sample DataFrames.
+
+    Args:
+        sample_targets_df: Optional sample of raw or normalized target records.
+        sample_s1_df: Optional sample of raw or normalized S1 queries.
+        safety_margin: Multiplier applied to empirical measurements (default 1.25).
+
+    Returns:
+        Dict[str, float]: Measured conservative byte sizes per row/item.
+    """
+    # 1. Target row bytes (entity_id\tbusiness_name_norm\tbusiness_address_norm\tcountry_norm\tsource_dataset\n)
+    if sample_targets_df is not None and not sample_targets_df.empty:
+        norm_t = normalize_dataframe(sample_targets_df.copy(), inplace=True)
+        eids = norm_t["entity_id"].astype(str).tolist()
+        names = norm_t["business_name_norm"].astype(str).tolist()
+        addrs = norm_t["business_address_norm"].astype(str).tolist()
+        ctys = norm_t["country_norm"].astype(str).tolist() if "country_norm" in norm_t.columns else [""] * len(norm_t)
+        line_lens = [
+            len(f"{eid}\t{name}\t{addr}\t{cty}\tsource2\n".encode("utf-8"))
+            for eid, name, addr, cty in zip(eids, names, addrs, ctys)
+        ]
+        target_bpr = max(float(np.mean(line_lens)) * safety_margin, float(np.percentile(line_lens, 90)))
+    else:
+        target_bpr = 130.0 * safety_margin  # ~162.5 bytes
+
+    # 2. S1 row bytes (entity_id\tbusiness_name_norm\tbusiness_address_norm\tcountry_norm\n)
+    if sample_s1_df is not None and not sample_s1_df.empty:
+        norm_s1 = normalize_dataframe(sample_s1_df.copy(), inplace=True)
+        eids = norm_s1["entity_id"].astype(str).tolist()
+        names = norm_s1["business_name_norm"].astype(str).tolist()
+        addrs = norm_s1["business_address_norm"].astype(str).tolist()
+        ctys = norm_s1["country_norm"].astype(str).tolist() if "country_norm" in norm_s1.columns else [""] * len(norm_s1)
+        line_lens = [
+            len(f"{eid}\t{name}\t{addr}\t{cty}\n".encode("utf-8"))
+            for eid, name, addr, cty in zip(eids, names, addrs, ctys)
+        ]
+        s1_bpr = max(float(np.mean(line_lens)) * safety_margin, float(np.percentile(line_lens, 90)))
+    else:
+        s1_bpr = 110.0 * safety_margin  # ~137.5 bytes
+
+    # 3. Intermediate row bytes (s1_id\tcandidate_id\tsource_dataset\trule_name\tscore\n)
+    intermediate_bpr = 70.0 * safety_margin  # ~87.5 bytes
+
+    # 4. Provenance row bytes (source1_entity_id\tcandidate_entity_id\tsource_dataset\tprovenance_rules\n)
+    provenance_bpr = 80.0 * safety_margin  # ~100.0 bytes
+
+    # 5. Candidate pairs bytes per query with C candidates: (base_id_len + C * candidate_entry_len)
+    pairs_base_bytes = 15.0 * safety_margin
+    pairs_bytes_per_cand = 15.0 * safety_margin
+
+    return {
+        "target_bpr": round(target_bpr, 1),
+        "s1_bpr": round(s1_bpr, 1),
+        "intermediate_bpr": round(intermediate_bpr, 1),
+        "provenance_bpr": round(provenance_bpr, 1),
+        "pairs_base_bytes": round(pairs_base_bytes, 1),
+        "pairs_bytes_per_cand": round(pairs_bytes_per_cand, 1),
+        "safety_margin": safety_margin,
+    }
+
+
 def check_resource_headroom(
     target_dir: Union[Path, str],
-    min_disk_gb: float = MIN_FREE_DISK_GB,
-    min_ram_gb: float = MIN_FREE_RAM_GB,
+    min_disk_gib: float = MIN_FREE_DISK_GB,
+    min_ram_gib: float = MIN_FREE_RAM_GB,
     shard_size: int = SHARD_SIZE_TARGETS,
     measured_bytes_per_target: Optional[float] = None,
     safety_margin: float = RAM_SAFETY_MARGIN,
@@ -127,13 +193,27 @@ def check_resource_headroom(
     estimated_target_count: int = 10300000,
     per_shard_candidate_cap: int = BLOCKING_PER_SHARD_CANDIDATE_CAP,
     max_candidates: int = BLOCKING_MAX_CANDIDATES_PER_S1,
+    sample_targets_df: Optional[pd.DataFrame] = None,
+    sample_s1_df: Optional[pd.DataFrame] = None,
+    enforce_worst_case_disk: bool = True,
+    min_disk_gb: Optional[float] = None,
+    min_ram_gb: Optional[float] = None,
 ) -> Tuple[bool, Dict[str, Any], str]:
     """Check free disk space and available system RAM against required shard headroom.
 
+    Calculates:
+    1. Conservative Capacity Projection (GiB): Assumes every S1 query matches the full
+       configured per_shard_candidate_cap across all target shards, and reaches max_candidates
+       in merged and final outputs, accounting for simultaneous .tmp file coexistence during merge.
+    2. Empirical Expected Projection (GiB): Consistent match sparsity projection assuming average
+       density (~20 matches/shard, ~36 final candidates/query) across all candidate structures.
+
+    All disk units are in GiB (1 GiB = 1024^3 bytes = 1,073,741,824 bytes).
+
     Args:
         target_dir: Output or scratch directory to check disk usage.
-        min_disk_gb: Minimum required free disk in gigabytes.
-        min_ram_gb: Minimum required available RAM in gigabytes.
+        min_disk_gib: Minimum required free disk in gibibytes (GiB).
+        min_ram_gib: Minimum required available RAM in gibibytes (GiB).
         shard_size: Number of target records per shard.
         measured_bytes_per_target: Measured index peak RSS bytes per target record.
         safety_margin: Multiplier for conservative RAM headroom.
@@ -141,77 +221,194 @@ def check_resource_headroom(
         estimated_target_count: Estimated total target records.
         per_shard_candidate_cap: Max candidate matches written per shard per query.
         max_candidates: Final candidate upper bound.
+        sample_targets_df: Optional sample target DataFrame for calibrated byte measurement.
+        sample_s1_df: Optional sample S1 DataFrame for calibrated byte measurement.
+        enforce_worst_case_disk: If True, checks free disk against conservative capacity projection.
 
     Returns:
         Tuple[bool, Dict[str, Any], str]: (is_safe, resource_dict, status_message).
     """
+    if min_disk_gb is not None:
+        min_disk_gib = min_disk_gb
+    if min_ram_gb is not None:
+        min_ram_gib = min_ram_gb
+
     path = Path(target_dir)
     path.mkdir(parents=True, exist_ok=True)
 
-    # 1. Disk usage calculation
+    # 1. Disk usage calculation (in GiB)
     total, used, free = shutil.disk_usage(path)
-    free_disk_gb = free / (1024 ** 3)
+    free_disk_gib = free / (1024 ** 3)
 
-    if shard_size >= 100000:
-        num_shards = max(1, math.ceil(estimated_target_count / max(shard_size, 1)))
-        est_s1 = estimated_s1_count
-    else:
-        num_shards = 4
-        est_s1 = min(estimated_s1_count, 1000)
+    num_shards = max(1, math.ceil(estimated_target_count / max(shard_size, 1)))
 
-    # Estimate intermediate disk rows (bounded by per_shard_candidate_cap)
-    est_intermediate_rows = est_s1 * num_shards * min(per_shard_candidate_cap, 50)
-    est_intermediate_gb = (est_intermediate_rows * ESTIMATED_BYTES_PER_INTERMEDIATE_ROW) / (1024 ** 3)
-    est_final_gb = (est_s1 * max_candidates * 40) / (1024 ** 3)
-    required_disk_gb = max(min_disk_gb, round(est_intermediate_gb + est_final_gb + 0.5, 2))
+    # Calibrate / measure serialized row byte sizes
+    row_sizes = measure_serialized_row_sizes(
+        sample_targets_df=sample_targets_df,
+        sample_s1_df=sample_s1_df,
+        safety_margin=1.25,
+    )
+    t_bpr = row_sizes["target_bpr"]
+    s1_bpr = row_sizes["s1_bpr"]
+    inter_bpr = row_sizes["intermediate_bpr"]
+    prov_bpr = row_sizes["provenance_bpr"]
+    pairs_base = row_sizes["pairs_base_bytes"]
+    pairs_per_cand = row_sizes["pairs_bytes_per_cand"]
 
-    # 2. RAM availability
+    # Component A: Target shards partition files (raw TSV on disk)
+    target_shards_gib = (estimated_target_count * t_bpr) / (1024 ** 3)
+
+    # Component B: S1 query batch files (raw TSV on disk)
+    s1_batches_gib = (estimated_s1_count * s1_bpr) / (1024 ** 3)
+
+    # Component C: Intermediate candidate partitions (shard-by-batch TSVs)
+    # 1. Conservative (Full-Cap Saturation):
+    conservative_intermediate_rows = estimated_s1_count * num_shards * per_shard_candidate_cap
+    conservative_intermediate_gib = (conservative_intermediate_rows * inter_bpr) / (1024 ** 3)
+
+    # 2. Empirical (Match Sparsity):
+    empirical_matches_per_shard = min(per_shard_candidate_cap, 20)
+    empirical_intermediate_rows = estimated_s1_count * num_shards * empirical_matches_per_shard
+    empirical_intermediate_gib = (empirical_intermediate_rows * inter_bpr) / (1024 ** 3)
+
+    # Component D: Merged batch partitions (pairs + provenance per batch file before final merger)
+    # 1. Conservative (C_final = max_candidates)
+    pairs_bytes_cons = pairs_base + pairs_per_cand * max_candidates
+    merged_pairs_cons_gib = (estimated_s1_count * pairs_bytes_cons) / (1024 ** 3)
+    merged_prov_cons_gib = (estimated_s1_count * max_candidates * prov_bpr) / (1024 ** 3)
+    merged_batches_cons_gib = merged_pairs_cons_gib + merged_prov_cons_gib
+
+    # 2. Empirical (C_final = 36 average candidates)
+    empirical_final_cands = min(max_candidates, 36)
+    pairs_bytes_emp = pairs_base + pairs_per_cand * empirical_final_cands
+    merged_pairs_emp_gib = (estimated_s1_count * pairs_bytes_emp) / (1024 ** 3)
+    merged_prov_emp_gib = (estimated_s1_count * empirical_final_cands * prov_bpr) / (1024 ** 3)
+    merged_batches_emp_gib = merged_pairs_emp_gib + merged_prov_emp_gib
+
+    # Component E: Final merged output files (candidate_pairs.tsv + candidate_provenance.tsv)
+    final_outputs_cons_gib = merged_batches_cons_gib
+    final_outputs_emp_gib = merged_batches_emp_gib
+
+    # Component F: Temporary write files & coexistence overhead during final merge
+    # During merge_candidate_partitions, candidate_pairs.tsv.tmp and candidate_provenance.tsv.tmp
+    # coexist on disk simultaneously with merged_batches/ files until final atomic replacement.
+    tmp_coexistence_cons_gib = final_outputs_cons_gib + 0.5
+    tmp_coexistence_emp_gib = final_outputs_emp_gib + 0.5
+
+    # Total Peak Disk Projections (in GiB)
+    conservative_projection_gib = max(
+        min_disk_gib,
+        round(
+            target_shards_gib
+            + s1_batches_gib
+            + conservative_intermediate_gib
+            + merged_batches_cons_gib
+            + final_outputs_cons_gib
+            + tmp_coexistence_cons_gib,
+            2,
+        ),
+    )
+
+    empirical_projection_gib = max(
+        min_disk_gib,
+        round(
+            target_shards_gib
+            + s1_batches_gib
+            + empirical_intermediate_gib
+            + merged_batches_emp_gib
+            + final_outputs_emp_gib
+            + tmp_coexistence_emp_gib,
+            2,
+        ),
+    )
+
+    required_disk_gib = conservative_projection_gib if enforce_worst_case_disk else empirical_projection_gib
+
+    # 2. RAM availability (in GiB)
     avail_ram_bytes = get_available_ram_bytes()
-    avail_ram_gb = round(avail_ram_bytes / (1024 ** 3), 2) if avail_ram_bytes is not None else None
+    avail_ram_gib = round(avail_ram_bytes / (1024 ** 3), 2) if avail_ram_bytes is not None else None
 
     if measured_bytes_per_target is None:
-        # Fails safely if RAM cannot be estimated from a measurement
         return False, {
-            "free_disk_gb": round(free_disk_gb, 2),
-            "available_ram_gb": avail_ram_gb,
-            "required_disk_gb": required_disk_gb,
-            "required_ram_gb": None,
+            "free_disk_gib": round(free_disk_gib, 2),
+            "available_ram_gib": avail_ram_gib,
+            "conservative_projection_gib": conservative_projection_gib,
+            "empirical_projection_gib": empirical_projection_gib,
+            "required_disk_gib": required_disk_gib,
+            "required_ram_gib": None,
         }, "Resource check failed: Measured bytes per target was not provided. Run memory benchmark before proceeding."
 
-    # Dynamic RAM required for 1 resident shard + query buffer + safety margin + OS headroom
-    shard_ram_gb = (shard_size * measured_bytes_per_target * safety_margin) / (1024 ** 3)
-    required_ram_gb = max(min_ram_gb, round(shard_ram_gb + 0.5, 2))
+    shard_ram_gib = (shard_size * measured_bytes_per_target * safety_margin) / (1024 ** 3)
+    required_ram_gib = max(min_ram_gib, round(shard_ram_gib + 0.5, 2))
 
     res: Dict[str, Any] = {
-        "free_disk_gb": round(free_disk_gb, 2),
-        "required_disk_gb": required_disk_gb,
-        "available_ram_gb": avail_ram_gb,
-        "required_ram_gb": required_ram_gb,
+        "free_disk_gib": round(free_disk_gib, 2),
+        "required_disk_gib": required_disk_gib,
+        "conservative_projection_gib": conservative_projection_gib,
+        "empirical_projection_gib": empirical_projection_gib,
+        "available_ram_gib": avail_ram_gib,
+        "required_ram_gib": required_ram_gib,
         "measured_bytes_per_target": round(measured_bytes_per_target, 2),
+        "num_shards": num_shards,
+        "estimated_s1_count": estimated_s1_count,
+        "estimated_target_count": estimated_target_count,
+        "per_shard_candidate_cap": per_shard_candidate_cap,
+        "max_candidates": max_candidates,
+        "row_sizes_bytes": row_sizes,
+        "disk_breakdown_gib": {
+            "target_shards_gib": round(target_shards_gib, 3),
+            "s1_batches_gib": round(s1_batches_gib, 3),
+            "conservative_intermediate_gib": round(conservative_intermediate_gib, 3),
+            "empirical_intermediate_gib": round(empirical_intermediate_gib, 3),
+            "merged_batches_conservative_gib": round(merged_batches_cons_gib, 3),
+            "merged_batches_empirical_gib": round(merged_batches_emp_gib, 3),
+            "final_outputs_conservative_gib": round(final_outputs_cons_gib, 3),
+            "final_outputs_empirical_gib": round(final_outputs_emp_gib, 3),
+            "tmp_coexistence_conservative_gib": round(tmp_coexistence_cons_gib, 3),
+            "tmp_coexistence_empirical_gib": round(tmp_coexistence_emp_gib, 3),
+        },
+        # Backward compatibility aliases
+        "free_disk_gb": round(free_disk_gib, 2),
+        "required_disk_gb": required_disk_gib,
+        "worst_case_required_disk_gb": conservative_projection_gib,
+        "empirical_required_disk_gb": empirical_projection_gib,
+        "available_ram_gb": avail_ram_gib,
+        "required_ram_gb": required_ram_gib,
+        "disk_breakdown_gb": {
+            "target_shards_gb": round(target_shards_gib, 3),
+            "s1_batches_gb": round(s1_batches_gib, 3),
+            "worst_case_intermediate_gb": round(conservative_intermediate_gib, 3),
+            "empirical_intermediate_gb": round(empirical_intermediate_gib, 3),
+            "merged_batches_gb": round(merged_batches_cons_gib, 3),
+            "final_outputs_gb": round(final_outputs_cons_gib, 3),
+            "tmp_buffers_gb": round(tmp_coexistence_cons_gib, 3),
+        },
     }
 
-    if free_disk_gb < required_disk_gb:
+    if free_disk_gib < required_disk_gib:
         msg = (
-            f"Insufficient disk space in '{path.resolve()}': {free_disk_gb:.2f} GB free "
-            f"(estimated required: {required_disk_gb:.2f} GB for intermediate partitions and final candidate tables)."
+            f"Insufficient disk space in '{path.resolve()}': {free_disk_gib:.2f} GiB free "
+            f"(conservative capacity projection: {conservative_projection_gib:.2f} GiB, "
+            f"empirical expected projection: {empirical_projection_gib:.2f} GiB "
+            f"for {num_shards} target shards, per-shard cap {per_shard_candidate_cap}, and {estimated_s1_count:,} S1 queries)."
         )
         return False, res, msg
 
-    if avail_ram_gb is None:
+    if avail_ram_gib is None:
         msg = "Resource check failed: Available system RAM could not be measured and no safe metric was available."
         return False, res, msg
 
-    if avail_ram_gb < required_ram_gb:
+    if avail_ram_gib < required_ram_gib:
         msg = (
-            f"Insufficient available RAM: {avail_ram_gb:.2f} GB available "
-            f"(minimum required: {required_ram_gb:.2f} GB based on measured {measured_bytes_per_target:.1f} bytes/target "
+            f"Insufficient available RAM: {avail_ram_gib:.2f} GiB available "
+            f"(minimum required: {required_ram_gib:.2f} GiB based on measured {measured_bytes_per_target:.1f} bytes/target "
             f"for shard size {shard_size:,} with {safety_margin:.1f}x safety margin)."
         )
         return False, res, msg
 
     msg = (
-        f"Resource check passed: {free_disk_gb:.2f} GB disk free (req: {required_disk_gb:.2f} GB), "
-        f"{avail_ram_gb:.2f} GB RAM available (req: {required_ram_gb:.2f} GB)."
+        f"Resource check passed: {free_disk_gib:.2f} GiB disk free (conservative req: {conservative_projection_gib:.2f} GiB, "
+        f"empirical expected: {empirical_projection_gib:.2f} GiB), {avail_ram_gib:.2f} GiB RAM available (req: {required_ram_gib:.2f} GiB)."
     )
     return True, res, msg
 

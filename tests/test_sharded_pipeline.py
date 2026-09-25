@@ -26,6 +26,7 @@ from src.batch_pipeline import (
     check_resource_headroom,
     compute_manifest_fingerprint,
     get_available_ram_bytes,
+    measure_serialized_row_sizes,
     merge_candidate_partitions,
     partition_s1_queries,
     partition_target_sources,
@@ -117,6 +118,8 @@ class TestShardedPipeline(unittest.TestCase):
             min_ram_gb=0.01,
             shard_size=100,
             measured_bytes_per_target=350.0,
+            estimated_s1_count=40,
+            estimated_target_count=120,
         )
         self.assertTrue(is_safe)
         self.assertIn("free_disk_gb", res)
@@ -517,6 +520,114 @@ class TestShardedPipeline(unittest.TestCase):
         self.assertEqual(summary["mode"], "test")
         self.assertEqual(summary["total_s1_processed"], 10)
         self.assertTrue(summary["validation_schema_valid"])
+
+    def test_disk_preflight_scales_with_per_shard_candidate_cap(self):
+        """Verify that worst-case intermediate disk estimate scales proportionally with per_shard_candidate_cap.
+        
+        Changing cap from 50 to 250 must scale the intermediate disk estimate by exactly 5x
+        without being artificially clamped to 50.
+        """
+        _, res_50, _ = check_resource_headroom(
+            target_dir=self.out_dir,
+            shard_size=500000,
+            measured_bytes_per_target=300.0,
+            estimated_s1_count=330000,
+            estimated_target_count=10300000,
+            per_shard_candidate_cap=50,
+            max_candidates=250,
+        )
+
+        _, res_250, _ = check_resource_headroom(
+            target_dir=self.out_dir,
+            shard_size=500000,
+            measured_bytes_per_target=300.0,
+            estimated_s1_count=330000,
+            estimated_target_count=10300000,
+            per_shard_candidate_cap=250,
+            max_candidates=250,
+        )
+
+        inter_50 = res_50["disk_breakdown_gb"]["worst_case_intermediate_gb"]
+        inter_250 = res_250["disk_breakdown_gb"]["worst_case_intermediate_gb"]
+
+        # 250 / 50 = 5.0x scaling
+        self.assertAlmostEqual(inter_250 / inter_50, 5.0, places=2)
+        self.assertGreater(res_250["worst_case_required_disk_gb"], res_50["worst_case_required_disk_gb"])
+
+    def test_check_resource_headroom_insufficient_disk(self):
+        """Verify that preflight halts with is_safe=False when available disk is less than required."""
+        with patch("shutil.disk_usage", return_value=(100 * 1024**3, 99 * 1024**3, 1 * 1024**3)):  # 1 GB free
+            is_safe, res_info, msg = check_resource_headroom(
+                target_dir=self.out_dir,
+                shard_size=500000,
+                measured_bytes_per_target=300.0,
+                estimated_s1_count=330000,
+                estimated_target_count=10300000,
+                per_shard_candidate_cap=250,
+                max_candidates=250,
+            )
+
+            self.assertFalse(is_safe)
+            self.assertIn("Insufficient disk space", msg)
+            self.assertIn("conservative capacity projection", msg)
+            self.assertIn("empirical expected projection", msg)
+            self.assertEqual(res_info["free_disk_gib"], 1.0)
+            self.assertGreater(res_info["conservative_projection_gib"], 1.0)
+
+    def test_measure_serialized_row_sizes_with_long_fields(self):
+        """Verify measure_serialized_row_sizes measures serialized byte lengths accurately with safety margin."""
+        df_long = pd.DataFrame({
+            "entity_id": [f"S2-LONG-ID-ENTERPRISE-VALUE-{i:06d}" for i in range(100)],
+            "business_name": ["Super Extended International Corporation Holding Global Solutions Logistics" * 2] * 100,
+            "business_address": ["999999 Very Long Industrial Boulevard Suite 12345 Floor 99 Tech Park North West" * 2] * 100,
+            "country": ["united states of america"] * 100,
+        })
+        row_sizes = measure_serialized_row_sizes(sample_targets_df=df_long, safety_margin=1.25)
+        self.assertGreater(row_sizes["target_bpr"], 200.0)
+        self.assertIn("intermediate_bpr", row_sizes)
+        self.assertIn("provenance_bpr", row_sizes)
+
+    def test_temporary_coexistence_overhead_in_preflight(self):
+        """Verify that temporary coexistence buffer covers final outputs plus atomic write buffer."""
+        _, res_info, _ = check_resource_headroom(
+            target_dir=self.out_dir,
+            shard_size=500000,
+            measured_bytes_per_target=300.0,
+            estimated_s1_count=330000,
+            estimated_target_count=10300000,
+            per_shard_candidate_cap=250,
+            max_candidates=250,
+        )
+
+        db_gib = res_info["disk_breakdown_gib"]
+        self.assertAlmostEqual(
+            db_gib["tmp_coexistence_conservative_gib"],
+            db_gib["final_outputs_conservative_gib"] + 0.5,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            db_gib["tmp_coexistence_empirical_gib"],
+            db_gib["final_outputs_empirical_gib"] + 0.5,
+            places=2,
+        )
+
+    def test_gib_units_and_projections_consistency(self):
+        """Verify that all disk headroom calculations use GiB (1024^3 bytes) and maintain projection bounds."""
+        _, res_info, msg = check_resource_headroom(
+            target_dir=self.out_dir,
+            shard_size=500000,
+            measured_bytes_per_target=300.0,
+            estimated_s1_count=330000,
+            estimated_target_count=10300000,
+            per_shard_candidate_cap=250,
+            max_candidates=250,
+        )
+
+        self.assertIn("GiB", msg)
+        self.assertIn("free_disk_gib", res_info)
+        self.assertIn("conservative_projection_gib", res_info)
+        self.assertIn("empirical_projection_gib", res_info)
+        self.assertGreater(res_info["conservative_projection_gib"], res_info["empirical_projection_gib"])
 
 
 if __name__ == "__main__":

@@ -324,8 +324,20 @@ def run_validation_evaluation(
         estimated_target_count=10300000,
         per_shard_candidate_cap=BLOCKING_PER_SHARD_CANDIDATE_CAP,
         max_candidates=max_candidates,
+        sample_targets_df=sample_targets,
+        sample_s1_df=sample_s1_df,
     )
     print(f"[RESOURCE CHECK] {msg}", flush=True)
+    if "disk_breakdown_gib" in res_info:
+        db = res_info["disk_breakdown_gib"]
+        print(
+            f"  -> Disk Breakdown (GiB): Target Shards={db['target_shards_gib']:.2f} GiB, S1 Batches={db['s1_batches_gib']:.2f} GiB,\n"
+            f"     Intermediate: Conservative={db['conservative_intermediate_gib']:.2f} GiB (Empirical={db['empirical_intermediate_gib']:.2f} GiB),\n"
+            f"     Merged Batches: Conservative={db['merged_batches_conservative_gib']:.2f} GiB (Empirical={db['merged_batches_empirical_gib']:.2f} GiB),\n"
+            f"     Final Outputs: Conservative={db['final_outputs_conservative_gib']:.2f} GiB (Empirical={db['final_outputs_empirical_gib']:.2f} GiB),\n"
+            f"     Merge Coexistence / Tmp: {db['tmp_coexistence_conservative_gib']:.2f} GiB (Empirical={db['tmp_coexistence_empirical_gib']:.2f} GiB)",
+            flush=True,
+        )
     if not is_safe:
         raise RuntimeError(f"Resource safety check failed: {msg}")
 
@@ -517,8 +529,20 @@ def run_test_generation(
         estimated_target_count=10000000,
         per_shard_candidate_cap=BLOCKING_PER_SHARD_CANDIDATE_CAP,
         max_candidates=max_candidates,
+        sample_targets_df=sample_targets,
+        sample_s1_df=sample_s1_df,
     )
     print(f"[RESOURCE CHECK] {msg}", flush=True)
+    if "disk_breakdown_gib" in res_info:
+        db = res_info["disk_breakdown_gib"]
+        print(
+            f"  -> Disk Breakdown (GiB): Target Shards={db['target_shards_gib']:.2f} GiB, S1 Batches={db['s1_batches_gib']:.2f} GiB,\n"
+            f"     Intermediate: Conservative={db['conservative_intermediate_gib']:.2f} GiB (Empirical={db['empirical_intermediate_gib']:.2f} GiB),\n"
+            f"     Merged Batches: Conservative={db['merged_batches_conservative_gib']:.2f} GiB (Empirical={db['merged_batches_empirical_gib']:.2f} GiB),\n"
+            f"     Final Outputs: Conservative={db['final_outputs_conservative_gib']:.2f} GiB (Empirical={db['final_outputs_empirical_gib']:.2f} GiB),\n"
+            f"     Merge Coexistence / Tmp: {db['tmp_coexistence_conservative_gib']:.2f} GiB (Empirical={db['tmp_coexistence_empirical_gib']:.2f} GiB)",
+            flush=True,
+        )
     if not is_safe:
         raise RuntimeError(f"Resource safety check failed: {msg}")
 
