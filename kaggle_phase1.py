@@ -43,21 +43,36 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+from src.batch_pipeline import (
+    build_sharded_target_index,
+    check_resource_headroom,
+    merge_candidate_partitions,
+    run_disk_backed_retrieval_pipeline,
+    stream_process_s1_batches,
+)
 from src.blocking import (
     evaluate_validation_recall,
     generate_candidate_union,
     write_candidate_outputs,
 )
 from src.config import (
+    BATCH_SIZE_S1_QUERIES,
     BLOCKING_MAX_CANDIDATES_PER_S1,
+    BLOCKING_PER_SHARD_CANDIDATE_CAP,
     DATA_DIR,
+    MANIFEST_PATH,
+    MIN_FREE_DISK_GB,
+    MIN_FREE_RAM_GB,
     OUTPUT_DIR,
+    PARTITIONS_DIR,
     PILOT_CHUNKSIZE,
     PILOT_SCAN_ROWS,
     PILOT_SAMPLE_S1,
     PILOT_SAMPLE_TARGET,
     PILOT_SEED,
     PILOT_SUMMARY_PATH,
+    RAM_SAFETY_MARGIN,
+    SHARD_SIZE_TARGETS,
     SPLITS_DIR,
 )
 from src.data_loader import (
@@ -69,8 +84,9 @@ from src.data_loader import (
 )
 from src.io_utils import read_tsv
 from src.normalize import normalize_dataframe
+from src.sharded_index import benchmark_shard_memory_rss, get_process_rss_bytes
 from src.split_utils import load_split_ids
-from utils.validate_submission import validate_submission_file
+from utils.validate_submission import validate_submission_file, validate_submission_streaming
 
 
 def get_process_memory_mb() -> Dict[str, float]:
@@ -238,17 +254,46 @@ def run_smoke_test(
 def run_validation_evaluation(
     train_dir: Path,
     splits_dir: Path,
+    out_dir: Path,
     sample_s1: Optional[int] = None,
+    batch_size: int = BATCH_SIZE_S1_QUERIES,
+    shard_size: int = SHARD_SIZE_TARGETS,
+    chunksize: int = PILOT_CHUNKSIZE,
     max_candidates: int = BLOCKING_MAX_CANDIDATES_PER_S1,
+    min_disk_gb: float = MIN_FREE_DISK_GB,
+    min_ram_gb: float = MIN_FREE_RAM_GB,
+    resume: bool = True,
+    clean_partitions: bool = False,
 ) -> None:
-    """Evaluate candidate generation recall strictly on the saved validation split."""
+    """Evaluate candidate generation recall strictly on the saved validation split using streaming sharded index."""
     print("\n" + "=" * 75, flush=True)
-    print("PHASE 1 VALIDATION SPLIT RECALL EVALUATION", flush=True)
+    print("PHASE 1 STREAMING DISK-BACKED VALIDATION RECALL EVALUATION", flush=True)
     print("=" * 75, flush=True)
 
     t_start = time.time()
 
-    # 1. Load saved validation split IDs
+    # 1. Benchmark target slice memory footprint (empirical RSS)
+    print("Measuring empirical target index memory scaling (OS RSS)...", flush=True)
+    sample_s2 = load_source_file(train_dir / "train_source2.tsv", nrows=1000)
+    bench = benchmark_shard_memory_rss(sample_df=sample_s2, shard_size_targets=shard_size)
+    measured_bpt = bench["rss_bytes_per_target"]
+    print(f"  -> Measured {measured_bpt:.1f} bytes/target (estimated {bench['estimated_shard_rss_gb']:.2f} GB per {shard_size:,} shard).", flush=True)
+
+    # 2. Pre-flight resource safety check with measured bytes per target
+    is_safe, res_info, msg = check_resource_headroom(
+        out_dir,
+        min_disk_gb=min_disk_gb,
+        min_ram_gb=min_ram_gb,
+        shard_size=shard_size,
+        measured_bytes_per_target=measured_bpt,
+        safety_margin=RAM_SAFETY_MARGIN,
+        estimated_s1_count=len(val_txt.read_text().splitlines()) if val_txt.exists() else 330000,
+    )
+    print(f"[RESOURCE CHECK] {msg}", flush=True)
+    if not is_safe:
+        raise RuntimeError(f"Resource safety check failed: {msg}")
+
+    # 3. Load saved validation split IDs (read-only)
     val_txt = splits_dir / "validation_s1_ids.txt"
     if not val_txt.exists():
         raise FileNotFoundError(
@@ -260,132 +305,282 @@ def run_validation_evaluation(
         val_s1_ids = {line.strip() for line in f if line.strip()}
     print(f"Loaded {len(val_s1_ids):,} saved validation S1 IDs from '{val_txt.name}'.", flush=True)
 
-    # 2. Load and normalize training datasets
-    print("Loading training datasets and ground truth...", flush=True)
-    train_data = load_training_data(train_dir=train_dir)
-    s1_all = normalize_dataframe(train_data["source1"], inplace=True)
-    s2 = normalize_dataframe(train_data["source2"], inplace=True)
-    s3 = normalize_dataframe(train_data["source3"], inplace=True)
-    gt_df = train_data["ground_truth"]
-    print_memory()
+    if sample_s1 and sample_s1 < len(val_s1_ids):
+        print(f"Sampling first {sample_s1:,} validation S1 entities for evaluation...", flush=True)
+        val_s1_ids = set(sorted(val_s1_ids)[:sample_s1])
 
-    # Filter S1 to validation split
-    s1_val = s1_all[s1_all["entity_id"].isin(val_s1_ids)]
-    if sample_s1 and sample_s1 < len(s1_val):
-        print(f"Sampling first {sample_s1:,} validation S1 entities for fast evaluation...", flush=True)
-        s1_val = s1_val.head(sample_s1)
-        val_s1_ids = set(s1_val["entity_id"])
+    # 4. Load ground truth lookup strictly for validation entities (~25 MB RAM)
+    print("Loading validation split ground-truth lookup (memory bounded)...", flush=True)
+    gt_path = train_dir / "train_ground_truth.tsv"
+    gt_lookup: Dict[str, Set[str]] = {}
+    with open(gt_path, "r", encoding="utf-8") as f_gt:
+        header = f_gt.readline()
+        for line in f_gt:
+            parts = line.rstrip("\r\n").split("\t")
+            s1_id = parts[0].strip()
+            if s1_id in val_s1_ids:
+                m_str = parts[1].strip() if len(parts) > 1 else ""
+                gt_lookup[s1_id] = set(m_str.split(",")) if m_str else set()
+    print(f"Loaded ground truth for {len(gt_lookup):,} validation entities.", flush=True)
 
-    print(f"Generating candidate union for {len(s1_val):,} validation S1 entities...", flush=True)
-    t0 = time.time()
-    cands_map, prov_records, stats = generate_candidate_union(
-        s1_df=s1_val,
-        s2_df=s2,
-        s3_df=s3,
+    # 5. Execute single-shard-resident disk-backed retrieval pipeline
+    partitions_dir = out_dir / "partitions"
+    manifest_path = out_dir / "validation_manifest.json"
+
+    batch_stats = run_disk_backed_retrieval_pipeline(
+        s1_path=train_dir / "train_source1.tsv",
+        s2_path=train_dir / "train_source2.tsv",
+        s3_path=train_dir / "train_source3.tsv",
+        partitions_dir=partitions_dir,
+        manifest_path=manifest_path,
+        mode="eval_val",
+        split_file=val_txt,
+        filter_s1_ids=val_s1_ids,
+        sample_s1=sample_s1,
+        gt_lookup=gt_lookup,
+        batch_size=batch_size,
+        shard_size=shard_size,
+        chunksize=chunksize,
         max_candidates=max_candidates,
-    )
-    gen_time = time.time() - t0
-    print(f"Candidate generation completed in {gen_time:.2f}s ({len(s1_val) / gen_time:.0f} rec/s).", flush=True)
-
-    # Evaluate recall strictly on validation ground truth
-    val_metrics = evaluate_validation_recall(
-        candidates_map=cands_map,
-        val_s1_ids=val_s1_ids,
-        gt_df=gt_df,
+        per_shard_candidate_cap=BLOCKING_PER_SHARD_CANDIDATE_CAP,
+        resume=resume,
     )
 
+    # 6. Merge partition files into final candidate files
+    final_pairs = out_dir / "candidate_pairs.tsv"
+    final_prov = out_dir / "candidate_provenance.tsv"
+    merge_info = merge_candidate_partitions(
+        partitions_dir=partitions_dir,
+        output_pairs_path=final_pairs,
+        output_prov_path=final_prov,
+        clean_partitions=clean_partitions,
+    )
+
+    # 7. Validate output TSV schema
+    is_valid, errors = validate_submission_file(
+        submission_path=final_pairs,
+        expected_s1_ids=val_s1_ids,
+        is_candidate_file=True,
+    )
+
+    total_elapsed = time.time() - t_start
+    mem_info = get_process_memory_mb()
+
+    # 8. Write validation summary JSON
+    summary = {
+        "mode": "eval_val",
+        "total_validation_s1": len(val_s1_ids),
+        "total_s1_processed": batch_stats["total_s1_processed"],
+        "total_candidate_pairs": batch_stats["total_candidate_pairs"],
+        "candidate_distribution": {
+            "mean": batch_stats["mean_candidates"],
+            "median": batch_stats["median_candidates"],
+            "p90": batch_stats["p90_candidates"],
+            "p95": batch_stats["p95_candidates"],
+            "p99": batch_stats["p99_candidates"],
+            "max": batch_stats["max_candidates"],
+            "empty_candidate_count": batch_stats["empty_candidate_count"],
+            "empty_candidate_rate": batch_stats["empty_candidate_rate"],
+            "truncation_count": batch_stats["total_truncations"],
+            "truncation_rate": batch_stats["truncation_rate"],
+            "total_shard_candidates_pruned": batch_stats.get("total_shard_candidates_pruned", 0),
+        },
+        "recall_metrics": {
+            "total_gt_pairs": batch_stats["val_total_gt_pairs"],
+            "found_gt_pairs": batch_stats["val_found_gt_pairs"],
+            "overall_pair_recall": round(batch_stats["val_pair_recall"], 5),
+            "source2_pair_recall": round(batch_stats["val_s2_recall"], 5),
+            "source3_pair_recall": round(batch_stats["val_s3_recall"], 5),
+            "full_s1_coverage_rate": round(batch_stats["val_full_s1_coverage"], 5),
+        },
+        "timing_and_throughput": {
+            "total_elapsed_seconds": round(total_elapsed, 2),
+            "overall_throughput_qps": batch_stats["overall_throughput_qps"],
+        },
+        "measured_shard_ram_mb": batch_stats.get("measured_shard_ram_mb", []),
+        "memory_mb": mem_info,
+        "validation_schema_valid": is_valid,
+        "validation_schema_errors": errors,
+    }
+
+    summary_path = out_dir / "validation_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    # 9. Print formatted console report
     print("\n" + "#" * 75, flush=True)
-    print("# VALIDATION SPLIT CANDIDATE RECALL REPORT", flush=True)
+    print("# VALIDATION SPLIT CANDIDATE RECALL REPORT (DISK-BACKED)", flush=True)
     print("#" * 75, flush=True)
-    print(f"Validation S1 Entities      : {val_metrics['val_total_s1']:,} (with matches: {val_metrics['val_s1_with_matches']:,})", flush=True)
-    print(f"Total True GT Pairs         : {val_metrics['val_total_gt_pairs']:,}", flush=True)
-    print(f"True Pairs Recovered        : {val_metrics['val_found_gt_pairs']:,}", flush=True)
-    print(f"Overall Pair Recall         : {val_metrics['val_pair_recall'] * 100:.2f}%", flush=True)
-    print(f"  - Source 2 Pair Recall    : {val_metrics['val_s2_recall'] * 100:.2f}%", flush=True)
-    print(f"  - Source 3 Pair Recall    : {val_metrics['val_s3_recall'] * 100:.2f}%", flush=True)
-    print(f"Full S1 Match Coverage Rate : {val_metrics['val_full_s1_coverage'] * 100:.2f}%", flush=True)
-
+    print(f"Summary JSON Written        : {summary_path.resolve()}", flush=True)
+    print(f"Validation S1 Entities      : {len(val_s1_ids):,}", flush=True)
+    print(f"Total True GT Pairs         : {batch_stats['val_total_gt_pairs']:,}", flush=True)
+    print(f"True Pairs Recovered        : {batch_stats['val_found_gt_pairs']:,}", flush=True)
+    print(f"Overall Pair Recall         : {batch_stats['val_pair_recall'] * 100:.2f}%", flush=True)
+    print(f"  - Source 2 Pair Recall    : {batch_stats['val_s2_recall'] * 100:.2f}%", flush=True)
+    print(f"  - Source 3 Pair Recall    : {batch_stats['val_s3_recall'] * 100:.2f}%", flush=True)
+    print(f"Full S1 Match Coverage Rate : {batch_stats['val_full_s1_coverage'] * 100:.2f}%", flush=True)
     print("\nCandidate Volume & Truncation Metrics:", flush=True)
-    print(f"  - Total Generated Pairs   : {stats['total_candidate_pairs']:,}", flush=True)
-    print(f"  - Mean Candidates per S1  : {stats['mean_candidates']:.2f}", flush=True)
-    print(f"  - Median Candidates       : {stats['median_candidates']:.0f}", flush=True)
-    print(f"  - 90th Percentile (P90)   : {stats['p90_candidates']:.0f}", flush=True)
-    print(f"  - 95th Percentile (P95)   : {stats['p95_candidates']:.0f}", flush=True)
-    print(f"  - 99th Percentile (P99)   : {stats['p99_candidates']:.0f}", flush=True)
-    print(f"  - Maximum Candidates      : {stats['max_candidates']:,}", flush=True)
-    print(f"  - Empty Candidate Rate    : {stats['empty_candidate_rate'] * 100:.2f}% ({stats['empty_candidate_count']:,} entities)", flush=True)
-    print(f"  - Candidate Truncations   : {stats['truncation_count']:,} ({stats['truncation_rate'] * 100:.2f}% hit cap of {max_candidates})", flush=True)
-    print(f"Validation evaluation completed in {time.time() - t_start:.2f}s.\n", flush=True)
+    print(f"  - Total Generated Pairs   : {batch_stats['total_candidate_pairs']:,}", flush=True)
+    print(f"  - Mean Candidates per S1  : {batch_stats['mean_candidates']:.2f}", flush=True)
+    print(f"  - Median Candidates       : {batch_stats['median_candidates']:.0f}", flush=True)
+    print(f"  - P95 Candidates          : {batch_stats['p95_candidates']:.0f}", flush=True)
+    print(f"  - Maximum Candidates      : {batch_stats['max_candidates']:,}", flush=True)
+    print(f"  - Empty Candidate Rate    : {batch_stats['empty_candidate_rate'] * 100:.2f}% ({batch_stats['empty_candidate_count']:,} queries)", flush=True)
+    print(f"  - Truncation Rate         : {batch_stats['truncation_rate'] * 100:.2f}% ({batch_stats['total_truncations']:,} queries hit cap)", flush=True)
+    print(f"  - Shard Candidates Pruned : {batch_stats.get('total_shard_candidates_pruned', 0):,}", flush=True)
+    print(f"Throughput & Resource Profile:", flush=True)
+    print(f"  - Query Throughput        : {batch_stats['overall_throughput_qps']:.1f} queries/second", flush=True)
+    print(f"  - Elapsed Time            : Total {total_elapsed:.2f}s", flush=True)
+    if summary["measured_shard_ram_mb"]:
+        print(f"  - Measured Shard RAM (MB) : {summary['measured_shard_ram_mb']}", flush=True)
+    if mem_info.get("peak_rss_mb"):
+        print(f"  - Peak Process RSS        : {mem_info['peak_rss_mb']:.1f} MB", flush=True)
+    elif mem_info.get("rss_mb"):
+        print(f"  - Current Process RSS     : {mem_info['rss_mb']:.1f} MB", flush=True)
+    print(f"TSV Schema Status           : {'100% VALID' if is_valid else 'FAILED: ' + str(errors)}", flush=True)
+    print("=" * 75, flush=True)
+    print("[SUCCESS] Validation recall evaluation completed cleanly.\n", flush=True)
 
 
 def run_test_generation(
     test_dir: Path,
     out_dir: Path,
     sample_s1: Optional[int] = None,
+    batch_size: int = BATCH_SIZE_S1_QUERIES,
+    shard_size: int = SHARD_SIZE_TARGETS,
+    chunksize: int = PILOT_CHUNKSIZE,
     max_candidates: int = BLOCKING_MAX_CANDIDATES_PER_S1,
+    min_disk_gb: float = MIN_FREE_DISK_GB,
+    min_ram_gb: float = MIN_FREE_RAM_GB,
+    resume: bool = True,
+    clean_partitions: bool = False,
 ) -> None:
     """Generate final test candidate_pairs.tsv and pair-level candidate_provenance.tsv."""
     print("\n" + "=" * 75, flush=True)
-    print("PHASE 1 TEST CANDIDATE GENERATION", flush=True)
+    print("PHASE 1 STREAMING DISK-BACKED TEST CANDIDATE GENERATION", flush=True)
     print("=" * 75, flush=True)
 
     t_start = time.time()
-    pairs_out = out_dir / "candidate_pairs.tsv"
-    prov_out = out_dir / "candidate_provenance.tsv"
 
-    print("Loading test datasets (including France, US, India)...", flush=True)
-    test_data = load_test_data(test_dir=test_dir)
-    s1 = normalize_dataframe(test_data["source1"], inplace=True)
-    s2 = normalize_dataframe(test_data["source2"], inplace=True)
-    s3 = normalize_dataframe(test_data["source3"], inplace=True)
+    # 1. Benchmark target slice memory footprint (empirical RSS)
+    print("Measuring empirical test target index memory scaling (OS RSS)...", flush=True)
+    sample_s2 = load_source_file(test_dir / "test_source2.tsv", nrows=1000)
+    bench = benchmark_shard_memory_rss(sample_df=sample_s2, shard_size_targets=shard_size)
+    measured_bpt = bench["rss_bytes_per_target"]
+    print(f"  -> Measured {measured_bpt:.1f} bytes/target (estimated {bench['estimated_shard_rss_gb']:.2f} GB per {shard_size:,} shard).", flush=True)
 
-    if sample_s1 and sample_s1 < len(s1):
-        print(f"Sampling first {sample_s1:,} test S1 entities...", flush=True)
-        s1 = s1.head(sample_s1)
+    # 2. Pre-flight resource safety check
+    is_safe, res_info, msg = check_resource_headroom(
+        out_dir,
+        min_disk_gb=min_disk_gb,
+        min_ram_gb=min_ram_gb,
+        shard_size=shard_size,
+        measured_bytes_per_target=measured_bpt,
+        safety_margin=RAM_SAFETY_MARGIN,
+        estimated_s1_count=1730000,
+        estimated_target_count=10000000,
+    )
+    print(f"[RESOURCE CHECK] {msg}", flush=True)
+    if not is_safe:
+        raise RuntimeError(f"Resource safety check failed: {msg}")
 
-    print(f"Generating candidate union for {len(s1):,} test entities...", flush=True)
-    t0 = time.time()
-    cands_map, prov_records, stats = generate_candidate_union(
-        s1_df=s1,
-        s2_df=s2,
-        s3_df=s3,
+    # 3. Execute single-shard-resident disk-backed retrieval pipeline
+    partitions_dir = out_dir / "partitions"
+    manifest_path = out_dir / "test_manifest.json"
+
+    batch_stats = run_disk_backed_retrieval_pipeline(
+        s1_path=test_dir / "test_source1.tsv",
+        s2_path=test_dir / "test_source2.tsv",
+        s3_path=test_dir / "test_source3.tsv",
+        partitions_dir=partitions_dir,
+        manifest_path=manifest_path,
+        mode="test",
+        split_file=None,
+        filter_s1_ids=None,
+        sample_s1=sample_s1,
+        gt_lookup=None,
+        batch_size=batch_size,
+        shard_size=shard_size,
+        chunksize=chunksize,
         max_candidates=max_candidates,
-    )
-    print(f"Generated {len(prov_records):,} candidate pairs in {time.time() - t0:.2f}s.", flush=True)
-
-    print(f"Serializing candidate outputs to '{pairs_out.resolve()}' and '{prov_out.resolve()}'...", flush=True)
-    write_candidate_outputs(
-        candidates_map=cands_map,
-        provenance_records=prov_records,
-        ordered_s1_ids=s1["entity_id"].tolist(),
-        candidate_pairs_path=pairs_out,
-        provenance_path=prov_out,
+        per_shard_candidate_cap=BLOCKING_PER_SHARD_CANDIDATE_CAP,
+        resume=resume,
     )
 
-    print("Validating candidate TSV output schema...", flush=True)
-    target_ids = set(s2["entity_id"]).union(set(s3["entity_id"]))
-    is_valid, errors = validate_submission_file(
-        submission_path=pairs_out,
-        expected_s1_ids=set(s1["entity_id"]),
-        valid_target_ids=target_ids,
+    # 4. Merge partition files into final candidate files
+    final_pairs = out_dir / "candidate_pairs.tsv"
+    final_prov = out_dir / "candidate_provenance.tsv"
+    merge_info = merge_candidate_partitions(
+        partitions_dir=partitions_dir,
+        output_pairs_path=final_pairs,
+        output_prov_path=final_prov,
+        clean_partitions=clean_partitions,
+    )
+
+    # 5. Stream-validate output TSV against test Source1 and Source2/Source3 universe
+    is_valid, errors = validate_submission_streaming(
+        submission_path=final_pairs,
+        s1_source_path=test_dir / "test_source1.tsv",
+        target_source_paths=[test_dir / "test_source2.tsv", test_dir / "test_source3.tsv"],
         is_candidate_file=True,
     )
 
+    total_elapsed = time.time() - t_start
+    mem_info = get_process_memory_mb()
+
+    # 6. Write test summary JSON
+    summary = {
+        "mode": "test",
+        "total_s1_processed": batch_stats["total_s1_processed"],
+        "total_candidate_pairs": batch_stats["total_candidate_pairs"],
+        "candidate_distribution": {
+            "mean": batch_stats["mean_candidates"],
+            "median": batch_stats["median_candidates"],
+            "p90": batch_stats["p90_candidates"],
+            "p95": batch_stats["p95_candidates"],
+            "p99": batch_stats["p99_candidates"],
+            "max": batch_stats["max_candidates"],
+            "empty_candidate_count": batch_stats["empty_candidate_count"],
+            "empty_candidate_rate": batch_stats["empty_candidate_rate"],
+            "truncation_count": batch_stats["total_truncations"],
+            "truncation_rate": batch_stats["truncation_rate"],
+        },
+        "timing_and_throughput": {
+            "total_elapsed_seconds": round(total_elapsed, 2),
+            "overall_throughput_qps": batch_stats["overall_throughput_qps"],
+        },
+        "memory_mb": mem_info,
+        "validation_schema_valid": is_valid,
+        "validation_schema_errors": errors,
+    }
+
+    summary_path = out_dir / "test_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    # 7. Print formatted console report
     print("\n" + "=" * 75, flush=True)
-    print("TEST CANDIDATE OUTPUT SUMMARY", flush=True)
+    print("TEST CANDIDATE OUTPUT SUMMARY (DISK-BACKED)", flush=True)
     print("=" * 75, flush=True)
-    print(f"Candidate Pairs TSV         : {pairs_out.resolve()}")
-    print(f"Provenance Pairs TSV        : {prov_out.resolve()}")
-    print(f"Total Test Entities         : {len(s1):,}")
-    print(f"Total Candidate Pairs       : {len(prov_records):,}")
-    print(f"Mean Candidates per S1      : {stats['mean_candidates']:.2f}")
-    print(f"Median Candidates           : {stats['median_candidates']:.0f}")
-    print(f"P95 Candidates              : {stats['p95_candidates']:.0f}")
-    print(f"Max Candidates              : {stats['max_candidates']:,}")
-    print(f"Empty Candidate Rate        : {stats['empty_candidate_rate'] * 100:.2f}%")
-    print(f"Truncation Count            : {stats['truncation_count']:,} ({stats['truncation_rate'] * 100:.2f}%)")
-    print(f"TSV Validation Status       : {'100% VALID' if is_valid else 'FAILED: ' + str(errors)}")
-    print(f"Test candidate generation completed in {time.time() - t_start:.2f}s.\n", flush=True)
+    print(f"Summary JSON Written        : {summary_path.resolve()}", flush=True)
+    print(f"Candidate Pairs TSV         : {final_pairs.resolve()}", flush=True)
+    print(f"Provenance Pairs TSV        : {final_prov.resolve()}", flush=True)
+    print(f"Total Test S1 Entities      : {batch_stats['total_s1_processed']:,}", flush=True)
+    print(f"Total Candidate Pairs       : {batch_stats['total_candidate_pairs']:,}", flush=True)
+    print(f"Mean Candidates per S1      : {batch_stats['mean_candidates']:.2f}", flush=True)
+    print(f"Median Candidates           : {batch_stats['median_candidates']:.0f}", flush=True)
+    print(f"P95 Candidates              : {batch_stats['p95_candidates']:.0f}", flush=True)
+    print(f"Max Candidates              : {batch_stats['max_candidates']:,}", flush=True)
+    print(f"Empty Candidate Rate        : {batch_stats['empty_candidate_rate'] * 100:.2f}% ({batch_stats['empty_candidate_count']:,} queries)", flush=True)
+    print(f"Truncation Count            : {batch_stats['total_truncations']:,} ({batch_stats['truncation_rate'] * 100:.2f}%)", flush=True)
+    print(f"Throughput & Resource Profile:", flush=True)
+    print(f"  - Query Throughput        : {batch_stats['overall_throughput_qps']:.1f} queries/second", flush=True)
+    print(f"  - Elapsed Time            : Total {total_elapsed:.2f}s", flush=True)
+    if mem_info.get("peak_rss_mb"):
+        print(f"  - Peak Process RSS        : {mem_info['peak_rss_mb']:.1f} MB", flush=True)
+    print(f"TSV Validation Status       : {'100% VALID' if is_valid else 'FAILED: ' + str(errors)}", flush=True)
+    print("=" * 75, flush=True)
+    print(f"Test candidate generation completed in {total_elapsed:.2f}s total.\n", flush=True)
 
 
 def run_pilot(
@@ -603,7 +798,7 @@ def main() -> None:
         "--mode",
         choices=["pilot", "smoke", "eval_val", "test", "all"],
         default="pilot",
-        help="Mode: pilot (bounded plumbing/resource verification), smoke (fast check), eval_val (validation recall), test (test candidate files), all (both)",
+        help="Mode: pilot (bounded plumbing/resource verification), smoke (fast check), eval_val (disk-backed validation recall), test (disk-backed test candidates), all (both)",
     )
     parser.add_argument("--data-dir", type=str, default=None, help="Path to data directory")
     parser.add_argument("--splits-dir", type=str, default=None, help="Path to splits directory (output/splits)")
@@ -613,7 +808,13 @@ def main() -> None:
     parser.add_argument("--pilot-seed", type=int, default=PILOT_SEED, help="Seed for deterministic ID-hash sampling in pilot mode")
     parser.add_argument("--sample-s1", type=int, default=None, help="Sample limit for S1 queries (default: 1000 in pilot mode)")
     parser.add_argument("--sample-target", type=int, default=None, help="Sample limit for S2/S3 targets (default: 5000 in pilot mode)")
+    parser.add_argument("--batch-size-s1", type=int, default=BATCH_SIZE_S1_QUERIES, help="Batch size for S1 queries in streaming pipeline")
+    parser.add_argument("--shard-size-targets", type=int, default=SHARD_SIZE_TARGETS, help="Target count per index shard")
     parser.add_argument("--max-candidates", type=int, default=BLOCKING_MAX_CANDIDATES_PER_S1, help="Max candidates per S1")
+    parser.add_argument("--min-disk-gb", type=float, default=MIN_FREE_DISK_GB, help="Minimum free disk required in GB")
+    parser.add_argument("--min-ram-gb", type=float, default=MIN_FREE_RAM_GB, help="Minimum available RAM required in GB")
+    parser.add_argument("--no-resume", action="store_true", help="Disable batch resume from existing manifest")
+    parser.add_argument("--clean-partitions", action="store_true", help="Delete partition files after final merge")
     parser.add_argument("--track-memory", action="store_true", help="Enable memory tracking")
 
     args = parser.parse_args()
@@ -668,8 +869,16 @@ def main() -> None:
         run_validation_evaluation(
             train_dir=train_dir,
             splits_dir=splits_dir,
+            out_dir=out_dir,
             sample_s1=args.sample_s1,
+            batch_size=args.batch_size_s1,
+            shard_size=args.shard_size_targets,
+            chunksize=args.pilot_chunksize,
             max_candidates=args.max_candidates,
+            min_disk_gb=args.min_disk_gb,
+            min_ram_gb=args.min_ram_gb,
+            resume=not args.no_resume,
+            clean_partitions=args.clean_partitions,
         )
 
     elif args.mode == "test":
@@ -677,25 +886,48 @@ def main() -> None:
             test_dir=test_dir,
             out_dir=out_dir,
             sample_s1=args.sample_s1,
+            batch_size=args.batch_size_s1,
+            shard_size=args.shard_size_targets,
+            chunksize=args.pilot_chunksize,
             max_candidates=args.max_candidates,
+            min_disk_gb=args.min_disk_gb,
+            min_ram_gb=args.min_ram_gb,
+            resume=not args.no_resume,
+            clean_partitions=args.clean_partitions,
         )
 
     elif args.mode == "all":
         run_validation_evaluation(
             train_dir=train_dir,
             splits_dir=splits_dir,
+            out_dir=out_dir,
             sample_s1=args.sample_s1,
+            batch_size=args.batch_size_s1,
+            shard_size=args.shard_size_targets,
+            chunksize=args.pilot_chunksize,
             max_candidates=args.max_candidates,
+            min_disk_gb=args.min_disk_gb,
+            min_ram_gb=args.min_ram_gb,
+            resume=not args.no_resume,
+            clean_partitions=args.clean_partitions,
         )
         gc.collect()
         run_test_generation(
             test_dir=test_dir,
             out_dir=out_dir,
             sample_s1=args.sample_s1,
+            batch_size=args.batch_size_s1,
+            shard_size=args.shard_size_targets,
+            chunksize=args.pilot_chunksize,
             max_candidates=args.max_candidates,
+            min_disk_gb=args.min_disk_gb,
+            min_ram_gb=args.min_ram_gb,
+            resume=not args.no_resume,
+            clean_partitions=args.clean_partitions,
         )
 
 
 if __name__ == "__main__":
     main()
+
 

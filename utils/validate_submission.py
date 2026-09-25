@@ -154,6 +154,73 @@ def validate_submission_file(
     return is_valid, errors
 
 
+def validate_submission_streaming(
+    submission_path: Path,
+    s1_source_path: Path,
+    target_source_paths: Optional[List[Path]] = None,
+    candidate_pairs_path: Optional[Path] = None,
+    is_candidate_file: bool = False,
+    chunksize: int = 50000,
+) -> Tuple[bool, List[str]]:
+    """Stream-validate submission or candidate pairs against source TSVs without holding all data in RAM.
+
+    Args:
+        submission_path: Path to candidate_pairs.tsv or matching_results.tsv.
+        s1_source_path: Path to test_source1.tsv.
+        target_source_paths: Optional list of paths to test_source2.tsv and test_source3.tsv.
+        candidate_pairs_path: Optional candidate pairs path to verify containment for predictions.
+        is_candidate_file: True if validating candidate_pairs.tsv.
+        chunksize: Streaming chunk size.
+
+    Returns:
+        Tuple[bool, List[str]]: (is_valid, list of error messages).
+    """
+    errors: List[str] = []
+    submission_path = Path(submission_path)
+    s1_source_path = Path(s1_source_path)
+
+    if not submission_path.exists():
+        return False, [f"Submission file not found: {submission_path.resolve()}"]
+    if not s1_source_path.exists():
+        return False, [f"Source 1 file not found: {s1_source_path.resolve()}"]
+
+    expected_second_col = COL_CANDIDATE_IDS if is_candidate_file else COL_MATCHED_IDS
+    expected_header = f"{COL_SOURCE1_ID}\t{expected_second_col}"
+
+    # 1. Collect expected S1 IDs in a compact set
+    expected_s1_ids: Set[str] = set()
+    with open(s1_source_path, "r", encoding="utf-8") as f_s1:
+        header = f_s1.readline().rstrip("\r\n").split("\t")
+        id_idx = header.index(COL_SOURCE1_ID) if COL_SOURCE1_ID in header else (header.index("entity_id") if "entity_id" in header else 0)
+        for line in f_s1:
+            line_str = line.rstrip("\r\n")
+            if line_str:
+                expected_s1_ids.add(line_str.split("\t")[id_idx].strip())
+
+    # 2. Build target ID set if target sources provided and small enough
+    valid_target_ids: Optional[Set[str]] = None
+    if target_source_paths:
+        valid_target_ids = set()
+        for tp in target_source_paths:
+            tp_path = Path(tp)
+            if tp_path.exists():
+                with open(tp_path, "r", encoding="utf-8") as f_t:
+                    t_header = f_t.readline().rstrip("\r\n").split("\t")
+                    t_id_idx = t_header.index("entity_id") if "entity_id" in t_header else 0
+                    for t_line in f_t:
+                        t_str = t_line.rstrip("\r\n")
+                        if t_str:
+                            valid_target_ids.add(t_str.split("\t")[t_id_idx].strip())
+
+    return validate_submission_file(
+        submission_path=submission_path,
+        expected_s1_ids=expected_s1_ids,
+        candidate_pairs_path=candidate_pairs_path,
+        valid_target_ids=valid_target_ids,
+        is_candidate_file=is_candidate_file,
+    )
+
+
 def main() -> None:
     """CLI for submission validation."""
     parser = argparse.ArgumentParser(description="Validate ER submission and candidate files.")

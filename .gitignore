@@ -29,6 +29,8 @@ models/*.txt
 output/*.tsv
 output/*.csv
 output/*.parquet
+output/*.json
+output/partitions/
 output/smoke_*.tsv
 
 # IDE, OS, & scratch files

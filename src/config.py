@@ -83,7 +83,10 @@ BLOCKING_SAFETY_NET_MAX_BUCKET: int = int(os.environ.get("BLOCKING_SAFETY_NET_MA
 
 # 5. Overall Per-Entity Candidate Limit
 BLOCKING_MAX_CANDIDATES_PER_S1: int = int(os.environ.get("BLOCKING_MAX_CANDIDATES_PER_S1", "250"))
+BLOCKING_PER_SHARD_CANDIDATE_CAP: int = int(os.environ.get("BLOCKING_PER_SHARD_CANDIDATE_CAP", "250"))
 BLOCKING_SOFT_COUNTRY_MODE: bool = os.environ.get("BLOCKING_SOFT_COUNTRY_MODE", "true").lower() == "true"
+RAM_SAFETY_MARGIN: float = float(os.environ.get("RAM_SAFETY_MARGIN", "1.5"))
+ESTIMATED_BYTES_PER_INTERMEDIATE_ROW: int = int(os.environ.get("ESTIMATED_BYTES_PER_INTERMEDIATE_ROW", "60"))
 
 # Common corporate / legal terms used for core name derivation
 COMMON_LEGAL_TERMS: set[str] = {
@@ -103,4 +106,16 @@ PILOT_SEED: int = int(os.environ.get("PILOT_SEED", "42"))
 PILOT_SAMPLE_S1: int = int(os.environ.get("PILOT_SAMPLE_S1", "1000"))
 PILOT_SAMPLE_TARGET: int = int(os.environ.get("PILOT_SAMPLE_TARGET", "5000"))
 PILOT_SUMMARY_PATH: Path = OUTPUT_DIR / "pilot_summary.json"
+
+# ==============================================================================
+# Phase 1: Disk-Backed Sharded Retrieval & Streaming Pipeline Defaults
+# ==============================================================================
+SHARD_SIZE_TARGETS: int = int(os.environ.get("SHARD_SIZE_TARGETS", "2000000"))
+BATCH_SIZE_S1_QUERIES: int = int(os.environ.get("BATCH_SIZE_S1_QUERIES", "25000"))
+MIN_FREE_DISK_GB: float = float(os.environ.get("MIN_FREE_DISK_GB", "5.0"))
+MIN_FREE_RAM_GB: float = float(os.environ.get("MIN_FREE_RAM_GB", "2.0"))
+PARTITIONS_DIR: Path = OUTPUT_DIR / "partitions"
+MANIFEST_PATH: Path = OUTPUT_DIR / "phase1_manifest.json"
+
+
 
