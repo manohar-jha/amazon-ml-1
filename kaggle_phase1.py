@@ -30,6 +30,7 @@ import time
 import tracemalloc
 from pathlib import Path
 from typing import Any, Dict, Optional, Set
+import pandas as pd
 
 # Ensure project root in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -272,28 +273,7 @@ def run_validation_evaluation(
 
     t_start = time.time()
 
-    # 1. Benchmark target slice memory footprint (empirical RSS)
-    print("Measuring empirical target index memory scaling (OS RSS)...", flush=True)
-    sample_s2 = load_source_file(train_dir / "train_source2.tsv", nrows=1000)
-    bench = benchmark_shard_memory_rss(sample_df=sample_s2, shard_size_targets=shard_size)
-    measured_bpt = bench["rss_bytes_per_target"]
-    print(f"  -> Measured {measured_bpt:.1f} bytes/target (estimated {bench['estimated_shard_rss_gb']:.2f} GB per {shard_size:,} shard).", flush=True)
-
-    # 2. Pre-flight resource safety check with measured bytes per target
-    is_safe, res_info, msg = check_resource_headroom(
-        out_dir,
-        min_disk_gb=min_disk_gb,
-        min_ram_gb=min_ram_gb,
-        shard_size=shard_size,
-        measured_bytes_per_target=measured_bpt,
-        safety_margin=RAM_SAFETY_MARGIN,
-        estimated_s1_count=len(val_txt.read_text().splitlines()) if val_txt.exists() else 330000,
-    )
-    print(f"[RESOURCE CHECK] {msg}", flush=True)
-    if not is_safe:
-        raise RuntimeError(f"Resource safety check failed: {msg}")
-
-    # 3. Load saved validation split IDs (read-only)
+    # 1. Resolve and load saved validation split IDs first (read-only)
     val_txt = splits_dir / "validation_s1_ids.txt"
     if not val_txt.exists():
         raise FileNotFoundError(
@@ -308,6 +288,46 @@ def run_validation_evaluation(
     if sample_s1 and sample_s1 < len(val_s1_ids):
         print(f"Sampling first {sample_s1:,} validation S1 entities for evaluation...", flush=True)
         val_s1_ids = set(sorted(val_s1_ids)[:sample_s1])
+
+    s1_eval_count = len(val_s1_ids)
+
+    # 2. Benchmark target slice memory footprint (provisional RSS scaling with representative sample and query batch)
+    print("Measuring empirical target index memory scaling (OS RSS)...", flush=True)
+    sample_s2 = load_source_file(train_dir / "train_source2.tsv", nrows=2500)
+    sample_s3 = load_source_file(train_dir / "train_source3.tsv", nrows=2500)
+    sample_targets = pd.concat([sample_s2, sample_s3], ignore_index=True)
+    sample_s1_df = load_source_file(train_dir / "train_source1.tsv", nrows=200)
+
+    bench = benchmark_shard_memory_rss(
+        sample_df=sample_targets,
+        query_batch_df=sample_s1_df,
+        shard_size_targets=shard_size,
+    )
+    measured_bpt = bench["rss_bytes_per_target"]
+    print(
+        f"  -> [PROVISIONAL ESTIMATE] Measured {measured_bpt:.1f} bytes/target from sample (n={len(sample_targets):,}) "
+        f"with query batch (n={len(sample_s1_df):,}).\n"
+        f"     Provisional estimated shard footprint: {bench['estimated_shard_rss_gb']:.2f} GB per {shard_size:,} shard ({RAM_SAFETY_MARGIN}x safety margin).\n"
+        f"     (Note: actual peak RSS is monitored and logged per resident shard during execution.)",
+        flush=True,
+    )
+
+    # 3. Pre-flight resource safety check with measured bytes per target and actual S1 count
+    is_safe, res_info, msg = check_resource_headroom(
+        out_dir,
+        min_disk_gb=min_disk_gb,
+        min_ram_gb=min_ram_gb,
+        shard_size=shard_size,
+        measured_bytes_per_target=measured_bpt,
+        safety_margin=RAM_SAFETY_MARGIN,
+        estimated_s1_count=s1_eval_count,
+        estimated_target_count=10300000,
+        per_shard_candidate_cap=BLOCKING_PER_SHARD_CANDIDATE_CAP,
+        max_candidates=max_candidates,
+    )
+    print(f"[RESOURCE CHECK] {msg}", flush=True)
+    if not is_safe:
+        raise RuntimeError(f"Resource safety check failed: {msg}")
 
     # 4. Load ground truth lookup strictly for validation entities (~25 MB RAM)
     print("Loading validation split ground-truth lookup (memory bounded)...", flush=True)
@@ -462,12 +482,28 @@ def run_test_generation(
 
     t_start = time.time()
 
-    # 1. Benchmark target slice memory footprint (empirical RSS)
+    # 1. Benchmark target slice memory footprint (provisional RSS scaling with representative sample and query batch)
     print("Measuring empirical test target index memory scaling (OS RSS)...", flush=True)
-    sample_s2 = load_source_file(test_dir / "test_source2.tsv", nrows=1000)
-    bench = benchmark_shard_memory_rss(sample_df=sample_s2, shard_size_targets=shard_size)
+    sample_s2 = load_source_file(test_dir / "test_source2.tsv", nrows=2500)
+    sample_s3 = load_source_file(test_dir / "test_source3.tsv", nrows=2500)
+    sample_targets = pd.concat([sample_s2, sample_s3], ignore_index=True)
+    sample_s1_df = load_source_file(test_dir / "test_source1.tsv", nrows=200)
+
+    bench = benchmark_shard_memory_rss(
+        sample_df=sample_targets,
+        query_batch_df=sample_s1_df,
+        shard_size_targets=shard_size,
+    )
     measured_bpt = bench["rss_bytes_per_target"]
-    print(f"  -> Measured {measured_bpt:.1f} bytes/target (estimated {bench['estimated_shard_rss_gb']:.2f} GB per {shard_size:,} shard).", flush=True)
+    print(
+        f"  -> [PROVISIONAL ESTIMATE] Measured {measured_bpt:.1f} bytes/target from sample (n={len(sample_targets):,}) "
+        f"with query batch (n={len(sample_s1_df):,}).\n"
+        f"     Provisional estimated shard footprint: {bench['estimated_shard_rss_gb']:.2f} GB per {shard_size:,} shard ({RAM_SAFETY_MARGIN}x safety margin).\n"
+        f"     (Note: actual peak RSS is monitored and logged per resident shard during execution.)",
+        flush=True,
+    )
+
+    s1_test_count = sample_s1 if sample_s1 is not None else 1730000
 
     # 2. Pre-flight resource safety check
     is_safe, res_info, msg = check_resource_headroom(
@@ -477,8 +513,10 @@ def run_test_generation(
         shard_size=shard_size,
         measured_bytes_per_target=measured_bpt,
         safety_margin=RAM_SAFETY_MARGIN,
-        estimated_s1_count=1730000,
+        estimated_s1_count=s1_test_count,
         estimated_target_count=10000000,
+        per_shard_candidate_cap=BLOCKING_PER_SHARD_CANDIDATE_CAP,
+        max_candidates=max_candidates,
     )
     print(f"[RESOURCE CHECK] {msg}", flush=True)
     if not is_safe:
@@ -522,6 +560,7 @@ def run_test_generation(
         submission_path=final_pairs,
         s1_source_path=test_dir / "test_source1.tsv",
         target_source_paths=[test_dir / "test_source2.tsv", test_dir / "test_source3.tsv"],
+        sample_s1=sample_s1,
         is_candidate_file=True,
     )
 

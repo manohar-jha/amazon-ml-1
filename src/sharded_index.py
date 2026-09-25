@@ -441,9 +441,11 @@ def benchmark_shard_memory_rss(
     shard_size_targets: int = SHARD_SIZE_TARGETS,
     safety_margin: float = RAM_SAFETY_MARGIN,
 ) -> Dict[str, Any]:
-    """Measure actual OS-level RSS scaling from a representative target slice.
+    """Measure provisional OS-level RSS scaling from a representative target slice and query batch.
     
     Includes DataFrame loading, postings, MinHash LSH, and query buffers.
+    Note: This returns a provisional extrapolation estimate from a sample; full-shard peak
+    RSS is recorded per shard dynamically during execution.
     """
     gc.collect()
     rss_before = get_process_rss_bytes() or 0
@@ -479,6 +481,7 @@ def benchmark_shard_memory_rss(
         "rss_bytes_per_target": round(bytes_per_target, 2),
         "safety_margin": safety_margin,
         "estimated_shard_rss_gb": round(estimated_shard_rss_gb, 3),
+        "is_provisional_extrapolation": True,
     }
 
 

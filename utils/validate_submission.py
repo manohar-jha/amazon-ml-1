@@ -160,6 +160,7 @@ def validate_submission_streaming(
     target_source_paths: Optional[List[Path]] = None,
     candidate_pairs_path: Optional[Path] = None,
     is_candidate_file: bool = False,
+    sample_s1: Optional[int] = None,
     chunksize: int = 50000,
 ) -> Tuple[bool, List[str]]:
     """Stream-validate submission or candidate pairs against source TSVs without holding all data in RAM.
@@ -170,6 +171,7 @@ def validate_submission_streaming(
         target_source_paths: Optional list of paths to test_source2.tsv and test_source3.tsv.
         candidate_pairs_path: Optional candidate pairs path to verify containment for predictions.
         is_candidate_file: True if validating candidate_pairs.tsv.
+        sample_s1: Optional limit if running a sampled test run.
         chunksize: Streaming chunk size.
 
     Returns:
@@ -196,6 +198,8 @@ def validate_submission_streaming(
             line_str = line.rstrip("\r\n")
             if line_str:
                 expected_s1_ids.add(line_str.split("\t")[id_idx].strip())
+                if sample_s1 is not None and len(expected_s1_ids) >= sample_s1:
+                    break
 
     # 2. Build target ID set if target sources provided and small enough
     valid_target_ids: Optional[Set[str]] = None

@@ -38,6 +38,7 @@ from src.sharded_index import (
     benchmark_shard_memory_rss,
     measure_shard_memory,
 )
+from kaggle_phase1 import run_test_generation, run_validation_evaluation
 from utils.validate_submission import validate_submission_file, validate_submission_streaming
 
 
@@ -452,6 +453,70 @@ class TestShardedPipeline(unittest.TestCase):
         self.assertGreater(bench["rss_bytes_per_target"], 0.0)
         self.assertIn("estimated_shard_rss_gb", bench)
         self.assertIn("peak_rss_mb", bench)
+        self.assertTrue(bench.get("is_provisional_extrapolation"))
+
+    def test_run_validation_evaluation_end_to_end(self):
+        """Test kaggle_phase1.run_validation_evaluation end-to-end on synthetic data.
+        
+        Ensures split paths, variable scopes (e.g. val_txt), RSS benchmarks,
+        resource checks, sharded execution, and JSON/TSV outputs work without error.
+        """
+        eval_out_dir = self.base_path / "val_eval_out"
+        run_validation_evaluation(
+            train_dir=self.train_dir,
+            splits_dir=self.splits_dir,
+            out_dir=eval_out_dir,
+            sample_s1=10,
+            batch_size=5,
+            shard_size=20,
+            chunksize=20,
+            max_candidates=25,
+            min_disk_gb=0.001,
+            min_ram_gb=0.001,
+            resume=False,
+            clean_partitions=True,
+        )
+        self.assertTrue((eval_out_dir / "candidate_pairs.tsv").exists())
+        self.assertTrue((eval_out_dir / "candidate_provenance.tsv").exists())
+        self.assertTrue((eval_out_dir / "validation_summary.json").exists())
+
+        with open(eval_out_dir / "validation_summary.json", "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        self.assertEqual(summary["mode"], "eval_val")
+        self.assertEqual(summary["total_s1_processed"], 10)
+        self.assertTrue(summary["validation_schema_valid"])
+
+    def test_run_test_generation_end_to_end(self):
+        """Test kaggle_phase1.run_test_generation end-to-end on synthetic data."""
+        test_dir = self.base_path / "test_data"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.train_dir / "train_source1.tsv", test_dir / "test_source1.tsv")
+        shutil.copy(self.train_dir / "train_source2.tsv", test_dir / "test_source2.tsv")
+        shutil.copy(self.train_dir / "train_source3.tsv", test_dir / "test_source3.tsv")
+
+        test_out_dir = self.base_path / "test_gen_out"
+        run_test_generation(
+            test_dir=test_dir,
+            out_dir=test_out_dir,
+            sample_s1=10,
+            batch_size=5,
+            shard_size=20,
+            chunksize=20,
+            max_candidates=25,
+            min_disk_gb=0.001,
+            min_ram_gb=0.001,
+            resume=False,
+            clean_partitions=True,
+        )
+        self.assertTrue((test_out_dir / "candidate_pairs.tsv").exists())
+        self.assertTrue((test_out_dir / "candidate_provenance.tsv").exists())
+        self.assertTrue((test_out_dir / "test_summary.json").exists())
+
+        with open(test_out_dir / "test_summary.json", "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        self.assertEqual(summary["mode"], "test")
+        self.assertEqual(summary["total_s1_processed"], 10)
+        self.assertTrue(summary["validation_schema_valid"])
 
 
 if __name__ == "__main__":

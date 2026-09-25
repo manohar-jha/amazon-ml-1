@@ -367,6 +367,7 @@ def partition_s1_queries(
     batch_size: int = BATCH_SIZE_S1_QUERIES,
     chunksize: int = PILOT_CHUNKSIZE,
     filter_s1_ids: Optional[Set[str]] = None,
+    sample_s1: Optional[int] = None,
 ) -> Tuple[List[Path], int]:
     """Stream-normalize and slice Source 1 queries into disk-backed batch files with atomic writes."""
     s1_batches_dir.mkdir(parents=True, exist_ok=True)
@@ -391,9 +392,12 @@ def partition_s1_queries(
     f_out = open(curr_tmp_file, "w", encoding="utf-8", newline="")
     f_out.write("entity_id\tbusiness_name_norm\tbusiness_address_norm\tcountry_norm\n")
     total_s1 = 0
+    stopped_early = False
 
     try:
         for chunk in reader:
+            if stopped_early:
+                break
             chunk_norm = normalize_dataframe(chunk, inplace=True)
             if filter_s1_ids is not None:
                 chunk_norm = chunk_norm[chunk_norm["entity_id"].isin(filter_s1_ids)]
@@ -405,6 +409,10 @@ def partition_s1_queries(
                 ctys = chunk_norm["country_norm"].tolist() if "country_norm" in chunk_norm.columns else [""] * len(chunk_norm)
 
                 for eid, name, addr, cty in zip(eids, names, addrs, ctys):
+                    if sample_s1 is not None and total_s1 >= sample_s1:
+                        stopped_early = True
+                        break
+
                     if curr_batch_count >= batch_size:
                         f_out.close()
                         os.replace(curr_tmp_file, curr_batch_file)
@@ -564,6 +572,7 @@ def run_disk_backed_retrieval_pipeline(
             batch_size=batch_size,
             chunksize=chunksize,
             filter_s1_ids=filter_s1_ids,
+            sample_s1=sample_s1,
         )
     else:
         s1_batch_paths = existing_s1_batches
